@@ -1,10 +1,20 @@
 import torch
 import numpy as np
 import os
+import sys
 import random
 import codecs as cs
 from tqdm import tqdm
 from torch.utils.data import Dataset
+
+# 添加项目根目录到 Python 路径，以便可以直接运行此脚本
+# 如果直接运行脚本（不是作为模块），需要添加项目根目录到路径
+if not __package__:
+    # 获取当前脚本所在目录的父目录（项目根目录）
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(current_dir)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
 
 from data_loaders.smpl_collate import collate_motion
 from data_loaders.amasstools.globsmplrifke_feats import (
@@ -77,8 +87,24 @@ class AMASSMotionLoader:
         """
         path_meta = path.strip().split(",")
         data_path = path_meta[0]
-        motion_path = os.path.join(self.base_dir, data_path + self.ext)
-        smpl_data = np.load(motion_path)
+        
+        # 规范化路径：将路径中的正斜杠转换为系统分隔符
+        # 这样可以处理 split 文件中使用 '/' 但系统使用 '\' 的情况
+        normalized_path = data_path.replace('/', os.sep).replace('\\', os.sep)
+        motion_path = os.path.join(self.base_dir, normalized_path + self.ext)
+        
+        # 检查文件是否存在
+        if not os.path.exists(motion_path):
+            error_msg = f"文件不存在: {motion_path}"
+            print(error_msg)
+            raise FileNotFoundError(error_msg)
+        
+        try:
+            smpl_data = np.load(motion_path)
+        except Exception as e:
+            error_msg = f"无法加载文件: {motion_path}, 错误: {str(e)}"
+            print(error_msg)
+            raise RuntimeError(error_msg) from e
 
         poses = smpl_data["poses"].copy()
         trans = smpl_data["trans"].copy()
@@ -149,15 +175,50 @@ class MotionDataset(Dataset):
     Thin dataset wrapper around a motion loader callable.
     """
 
-    def __init__(self, motion_loader, split: str = "train", preload: bool = False):
+    def __init__(self, motion_loader, split: str = "train", preload: bool = False, skip_missing: bool = True):
+        """
+        初始化数据集
+        
+        参数:
+            motion_loader: 运动数据加载器实例（AMASSMotionLoader）
+            split (str): 数据集分割名称（'train', 'test', 'val' 等）
+            preload (bool): 是否在初始化时预加载所有数据到内存（默认 False）
+            skip_missing (bool): 是否跳过缺失的文件（默认 True）
+        """
         self.collate_fn = collate_motion
         self.split = split
-        self.keyids = read_split("data_loaders", split)
+        all_keyids = read_split("data_loaders", split)
         self.motion_loader = motion_loader
         self.is_training = "train" in split
 
+        # 验证文件是否存在，过滤掉缺失的文件
+        if skip_missing:
+            valid_keyids = []
+            base_dir = motion_loader.base_dir
+            ext = motion_loader.ext
+            
+            print(f"验证 {split} 分割中的文件...")
+            for keyid in tqdm(all_keyids, desc="验证文件"):
+                file_path = keyid.strip(".npy")
+                # 规范化路径
+                normalized_path = file_path.replace('/', os.sep).replace('\\', os.sep)
+                full_path = os.path.join(base_dir, normalized_path + ext)
+                
+                if os.path.exists(full_path):
+                    valid_keyids.append(keyid)
+                else:
+                    print(f"警告: 文件不存在，将跳过: {full_path}")
+            
+            self.keyids = valid_keyids
+            skipped_count = len(all_keyids) - len(valid_keyids)
+            print(f"验证完成: {len(valid_keyids)}/{len(all_keyids)} 个文件有效")
+            if skipped_count > 0:
+                print(f"已跳过 {skipped_count} 个缺失的文件")
+        else:
+            self.keyids = all_keyids
+
         if preload:
-            for _ in tqdm(self, desc="Preloading the dataset"):
+            for _ in tqdm(self, desc="预加载数据集"):
                 continue
 
     def __len__(self):
@@ -170,12 +231,30 @@ class MotionDataset(Dataset):
     def load_keyid(self, keyid):
         """
         Load a single example by key id.
+        
+        参数:
+            keyid (str): 样本的唯一标识符
+            
+        返回:
+            dict: 包含以下键的字典
+                - "x": Tensor[T, F] - 运动特征，T 为帧数，F 为特征维度
+                - "keyid": str - 样本 ID
+                - "length": int - 序列长度（帧数）
+                
+        异常:
+            FileNotFoundError: 如果文件不存在
+            RuntimeError: 如果文件加载失败
         """
         file_path = keyid.strip(".npy")
-        motion_x_dict = self.motion_loader(path=file_path)
-        x = motion_x_dict["x"]
-        length = motion_x_dict["length"]
-        return {"x": x, "keyid": keyid, "length": length}
+        
+        try:
+            motion_x_dict = self.motion_loader(path=file_path)
+            x = motion_x_dict["x"]
+            length = motion_x_dict["length"]
+            return {"x": x, "keyid": keyid, "length": length}
+        except (FileNotFoundError, RuntimeError) as e:
+            # 重新抛出异常，让调用者知道哪个文件有问题
+            raise RuntimeError(f"加载样本失败 {keyid}: {e}") from e
 
 
 if __name__ == "__main__":
