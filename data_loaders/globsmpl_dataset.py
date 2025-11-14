@@ -199,7 +199,12 @@ class MotionDataset(Dataset):
             
             print(f"验证 {split} 分割中的文件...")
             for keyid in tqdm(all_keyids, desc="验证文件"):
-                file_path = keyid.strip(".npy")
+                # 从 keyid 中提取文件路径部分（支持 "path, start, duration" 格式）
+                # 例如: "CMU/64/64_07_poses, 0, 62" -> "CMU/64/64_07_poses"
+                file_path = keyid.split(",")[0].strip()
+                # 移除可能的 .npy 后缀（如果存在）
+                if file_path.endswith(".npy"):
+                    file_path = file_path[:-4]
                 # 规范化路径
                 normalized_path = file_path.replace('/', os.sep).replace('\\', os.sep)
                 full_path = os.path.join(base_dir, normalized_path + ext)
@@ -233,7 +238,10 @@ class MotionDataset(Dataset):
         Load a single example by key id.
         
         参数:
-            keyid (str): 样本的唯一标识符
+            keyid (str): 样本的唯一标识符，支持以下格式：
+                - "path/to/file" - 简单路径格式
+                - "path/to/file, start, duration" - 带起始帧和持续帧数的格式
+                - "path/to/file.npy" - 带 .npy 后缀的格式（会自动移除）
             
         返回:
             dict: 包含以下键的字典
@@ -245,9 +253,23 @@ class MotionDataset(Dataset):
             FileNotFoundError: 如果文件不存在
             RuntimeError: 如果文件加载失败
         """
-        file_path = keyid.strip(".npy")
+        # 移除可能的 .npy 后缀（如果存在），但保留 ", start, duration" 部分
+        # 例如: "CMU/64/64_07_poses, 0, 62" 或 "CMU/64/64_07_poses.npy, 0, 62"
+        # 先提取文件路径部分（第一个逗号之前的部分）
+        path_parts = keyid.split(",", 1)
+        file_path_part = path_parts[0].strip()
+        # 如果文件路径部分以 .npy 结尾，移除它
+        if file_path_part.endswith(".npy"):
+            file_path_part = file_path_part[:-4]
+        # 如果有 ", start, duration" 部分，重新组合
+        if len(path_parts) > 1:
+            file_path = file_path_part + "," + path_parts[1]
+        else:
+            file_path = file_path_part
         
         try:
+            # 将完整的路径（包括 ", start, duration" 部分）传递给 motion_loader
+            # motion_loader.__call__ 会解析并处理这种格式
             motion_x_dict = self.motion_loader(path=file_path)
             x = motion_x_dict["x"]
             length = motion_x_dict["length"]
