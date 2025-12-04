@@ -2948,7 +2948,6 @@ CMU/79/79_52_poses.npy
 KIT/348/turn_right10_poses.npy
 CMU/26/26_05_poses.npy
 BMLmovi/Subject_2_F_MoSh/Subject_2_F_8_poses.npy
-CMU/76/76_07_poses.npy
 CMU/83/83_32_poses.npy
 KIT/952/wipe_back_horizontal03_poses.npy
 KIT/3/jump_right03_poses.npy
@@ -13679,7 +13678,6 @@ M/CMU/79/79_52_poses.npy
 M/KIT/348/turn_right10_poses.npy
 M/CMU/26/26_05_poses.npy
 M/BMLmovi/Subject_2_F_MoSh/Subject_2_F_8_poses.npy
-M/CMU/76/76_07_poses.npy
 M/CMU/83/83_32_poses.npy
 M/KIT/952/wipe_back_horizontal03_poses.npy
 M/KIT/3/jump_right03_poses.npy

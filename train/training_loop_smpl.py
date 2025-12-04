@@ -144,6 +144,8 @@ class TrainLoop:
                 batch = {key: val.to(self.device) if torch.is_tensor(val) else val for key, val in batch.items()}
 
                 self.run_step(batch)
+                print('step[{}]'.format(self.step+self.resume_step))
+                    
                 if self.step % self.log_interval == 0:
                     for k,v in logger.get_current().name2val.items():
                         if k == 'loss':
