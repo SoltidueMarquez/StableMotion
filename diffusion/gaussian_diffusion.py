@@ -106,14 +106,11 @@ class GaussianDiffusion:
     Ported directly from here, and then adapted over time to further experimentation.
     https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/diffusion_utils_2.py#L42
 
-    :param betas: a 1-D numpy array of betas for each diffusion timestep,
-                  starting at T and going to 1.
-    :param model_mean_type: a ModelMeanType determining what the model outputs.
-    :param model_var_type: a ModelVarType determining how variance is output.
-    :param loss_type: a LossType determining the loss function to use.
-    :param rescale_timesteps: if True, pass floating point timesteps into the
-                              model so that they are always scaled like in the
-                              original paper (0 to 1000).
+    :param betas: 一个一维 numpy 数组，表示每个扩散时间步的 beta，从 T 到 1。
+    :param model_mean_type: 一个 ModelMeanType，决定模型输出的含义。
+    :param model_var_type: 一个 ModelVarType，决定方差的输出方式。
+    :param loss_type: 一个 LossType，决定要使用的损失函数。
+    :param rescale_timesteps: 若为 True，将传入浮点时间步，使其始终按原论文的尺度（0 到 1000）处理。
     """
 
     def __init__(
@@ -224,15 +221,15 @@ class GaussianDiffusion:
         :param noise: if specified, the split-out normal noise.
         :return: A noisy version of x_start.
         """
-        if noise is None:
+        if noise is None:  # 未指定噪声时，按输入形状采样标准正态噪声
             noise = th.randn_like(x_start)
-        assert noise.shape == x_start.shape
+        assert noise.shape == x_start.shape  # 噪声必须与 x_start 形状一致
         res =  (
-            _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+            _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start  # 缩放 x_start
             + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
-            * noise
+            * noise  # 加上按时间步缩放后的噪声
         )
-        return res
+        return res  # 返回对应时间步的带噪样本
 
     def q_posterior_mean_variance(self, x_start, x_t, t):
         """
@@ -1323,31 +1320,38 @@ class GaussianDiffusion:
 
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, feature_w=None, snr_gamma=5, use_l1=False):
         """
-        Compute training losses for a single timestep.
+        计算单个时间步的训练损失。
 
-        :param model: the model to evaluate loss on.
-        :param x_start: the [N x C x ...] tensor of inputs.
-        :param t: a batch of timestep indices.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :param noise: if specified, the specific Gaussian noise to try to remove.
-        :return: a dict with the key "loss" containing a tensor of shape [N].
-                 Some mean or variance settings may also have other keys.
+        :param model: 用于评估损失的模型。
+        :param x_start: 形状为 [N x C x ...] 的输入张量。
+        :param t: 一批时间步索引。
+        :param model_kwargs: 若不为 None，提供给模型的额外关键字参数（可用于条件）。
+        :param noise: 如指定，表示尝试去除的特定高斯噪声。
+        :return: 一个包含键 "loss" 的字典，对应形状为 [N] 的张量；
+                 某些均值或方差设置下还会返回其他键。
         """
 
+        # 与 train/training_loop_smpl.py 的 mask_manager 对应：
+        # - mask_manager 把 batch 构造成 sample_cond，其中 y['mask'] 是逐特征逐时间步的生成/条件掩码；
+        # - sample_cond['inpaint_cond'] 也是在 mask_manager 里根据两种模式（检测 / inpaint）和随机遮挡得到。
+        # 这里直接读取 mask 和 inpaint_cond，用于：
         mask = model_kwargs['y']['mask']
-        inpaint_cond = model_kwargs['inpaint_cond']
+        inpaint_cond = model_kwargs['inpaint_cond'] # [B(128/512), D(233), N序列长度(100)]
+        print("inpaint_cond.shape:", inpaint_cond.shape)
 
-        if model_kwargs is None:
+        #   1) masked_l2 仅在未遮挡（条件）/需生成的位置计算损失；
+        if model_kwargs is None:             # 若未传额外条件参数，则用空字典占位
             model_kwargs = {}
-        if noise is None:
+        if noise is None:                    # 若未指定噪声，按 x_start 形状采样标准高斯噪声
             noise = th.randn_like(x_start)
         
+        #   2) 将 inpaint_cond 应用于 x_t，实现“条件位置保持原值、仅在需要生成的位置加噪”。
         x_t = self.q_sample(x_start, t, noise=noise)
         x_t = torch.where(inpaint_cond, x_t, x_start)
 
         terms = {}
 
+        # 会在每个时间步调用传入的模型 model(x_t, timestep, **model_kwargs) 获取预测，用它与目标（噪声或 x0）计算 loss。
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
             terms["loss"] = self._vb_terms_bpd(
                 model=model,
