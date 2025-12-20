@@ -250,7 +250,7 @@ class TrainLoop:
         sample_cond['inpaint_cond'] = inpaint_cond
         
         # used in gaussion diffusion training loss compute
-        sample_cond['y'] = {'mask': inpaint_cond} # bs, C, seqlen 
+        sample_cond['y'] = {'mask': inpaint_cond} # bs, C, seqlen
 
 
     def forward_backward(self, batch): #Training basic step

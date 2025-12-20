@@ -81,7 +81,10 @@ def prepare_cond_fn(args, motion_normalizer, device):
     )
 
 def choose_sampler(diffusion, ts_respace: bool):
-    """Pick DDIM or ancestral sampler."""
+    """
+    Pick DDIM or ancestral sampler.
+    现有 Enhanced 配置用的是默认q_sample，不是 DDIM
+    """
     return diffusion.ddim_sample_loop if ts_respace else diffusion.p_sample_loop
 
 def batch_expander(model_kwargs, repeat_times):
@@ -141,73 +144,83 @@ def footlocking_fn(x, t, model=None, mean=None, std=None, classifier_scale=0., J
     return grad
 
 def run_cleanup_selection(
-    model,
-    model_kwargs_detmode,
-    model_kwargs,
-    motion_normalizer,
-    sample_fn,
-    cond_fn,
-    args,
-    bs,
-    nfeats,
-    nframes,
+    model,                 # 扩散模型主体，既可检测也可修复
+    model_kwargs_detmode,  # 检测模式用的输入/掩码/长度等条件
+    model_kwargs,          # 修复模式用的输入/掩码/长度等条件
+    motion_normalizer,     # 归一化/反归一化工具
+    sample_fn,             # 采样循环函数（DDIM 或 p_sample）
+    cond_fn,               # 可选 classifier guidance 函数
+    args,                  # 运行配置（阈值、步数、开关等）
+    bs,                    # batch 大小
+    nfeats,                # 通道数
+    nframes,               # 帧数
 ):
     """
-    Wraps the detection->fixing pipeline with repeated sampling and candidate selection.
-
-    Returns:
-        sample (Tensor): The selected inpainted motion [bs, nfeats, nframes].
+    封装检测→修复的集成流程：
+      - 在检测模式下做多次快速前向，得到平均检测结果
+      - 基于检测结果膨胀、构建修复掩码与条件
+      - 在修复模式下扩展 batch 重复采样，得到若干候选
+      - 再用检测模式对候选打分，挑选最优的修复结果
+    返回：
+      sample (Tensor): 选中的修复结果 [bs, nfeats, nframes]
     """
     sample_candidates = []
-    forward_rp_times = 5  # Hardcode
-    eval_times = 25  # Hardcode
+    forward_rp_times = 5  # 固定：前向复制倍数（候选数量系数）
+    eval_times = 25  # 固定：快速检测评估次数（做均值）
 
-    rp_model_kwargs_detmode = batch_expander(model_kwargs_detmode, forward_rp_times)
+    # 把检测模式的 kwargs 复制 forward_rp_times 份，扩成更大的 batch，用于后续多次采样。
+    rp_model_kwargs_detmode = batch_expander(model_kwargs_detmode, forward_rp_times)  # 复制检测模式条件，扩展 batch
 
-    with torch.no_grad():
-        _re_sample = 0
-        _re_t = torch.ones((bs * forward_rp_times,), device=dist_util.dev()) * 49
-        for _ in tqdm(range(eval_times)):  # quick det sampler
-            x = torch.randn_like(rp_model_kwargs_detmode['y']['inpainted_motion'])
-            inpaint_cond = rp_model_kwargs_detmode['inpaint_cond']
-            x_gt = rp_model_kwargs_detmode['y']['inpainted_motion']
-            x = torch.where(inpaint_cond, x, x_gt)
-            _re_sample += model(x, _re_t, **rp_model_kwargs_detmode)
-        _re_sample = _re_sample / eval_times
+    # 在 torch.no_grad() 下用同一个 model 做了 eval_times 次前向检测（随机噪声起点，仅在待预测位置保留噪声），
+    # 把输出累加后取平均，目的是降低单次检测的随机波动，得到更稳定的检测结果；
+    # 随后反归一化并在标签通道做阈值，得到坏帧布尔掩码。
+    # 也就是在检测模式下做多次快速前向，得到平均检测结果
+    with torch.no_grad():                                      # 检测模式下快速均值
+        _re_sample = 0                                         # 累积检测输出，与模型在该时间步的输出一致，[bs * forward_rp_times, nfeats, nframes]。
+        _re_t = torch.ones((bs * forward_rp_times,), device=dist_util.dev()) * 49  # 固定时间步
+        for _ in tqdm(range(eval_times)):                      # 多次快速检测采样
+            x = torch.randn_like(rp_model_kwargs_detmode['y']['inpainted_motion'])  # 随机噪声起点
+            inpaint_cond = rp_model_kwargs_detmode['inpaint_cond']                  # 需要预测的位置
+            x_gt = rp_model_kwargs_detmode['y']['inpainted_motion']                 # 已知位置填原值
+            x = torch.where(inpaint_cond, x, x_gt)                                  # 只在待预测位置保持噪声
+            _re_sample += model(x, _re_t, **rp_model_kwargs_detmode)                # 前向得到检测输出
+        _re_sample = _re_sample / eval_times                                        # 求均值，降低方差
 
-    _sample = motion_normalizer.inverse(_re_sample.transpose(1, 2).cpu())
-    _label = _sample[..., -1] > args.ProbDetTh
+    # 之前的 _re_sample 还在“模型归一化空间”——训练时输入被 mean/std 标准化，模型输出也在同一尺度里。
+    # 现在需要反归一化到物理尺度，才能与真实运动数据对比。
+    _sample = motion_normalizer.inverse(_re_sample.transpose(1, 2).cpu())           # 反归一化到原尺度
+    _label = _sample[..., -1] > args.ProbDetTh                                      # 标签通道阈值化，得到坏帧布尔
 
     # -------------------------------
     # Preparing for Fixing Mode
     # -------------------------------
-    temp_labels = _label.clone()
-    _label[..., 1:] += temp_labels[..., :-1]
-    _label[..., :-1] += temp_labels[..., 1:]
-    for mids, mlen in enumerate(rp_model_kwargs_detmode['length'].cpu().numpy()):
+    temp_labels = _label.clone()                                                     # 备份坏帧标记
+    _label[..., 1:] += temp_labels[..., :-1]                                         # 左膨胀 1 帧
+    _label[..., :-1] += temp_labels[..., 1:]                                         # 右膨胀 1 帧
+    for mids, mlen in enumerate(rp_model_kwargs_detmode['length'].cpu().numpy()):    # 保证末帧为好帧
         _label[mids, ..., mlen - 1] = 0
 
-    det_good_frames_per_sample = {
+    det_good_frames_per_sample = {                                                   # 统计每个样本的好帧索引
         sample_i: np.nonzero(~_label.numpy()[sample_i].squeeze())[0].tolist()
         for sample_i in range(len(_label))
     }
 
     # Break Frame Fix
-    inpainting_mask_fixmode = torch.zeros_like(_re_sample).bool().to()  # True to keep, False to re-paint
-    for sample_i in range(len(_re_sample)):
+    inpainting_mask_fixmode = torch.zeros_like(_re_sample).bool().to()               # 修复掩码：True 保留，False 重绘
+    for sample_i in range(len(_re_sample)):                                          # 标记好帧为保留
         inpainting_mask_fixmode[sample_i, ..., det_good_frames_per_sample[sample_i]] = True
-    inpainting_mask_fixmode[:, -1] = True
+    inpainting_mask_fixmode[:, -1] = True                                            # 标签通道始终保留
 
-    inpaint_motion_fixmode = rp_model_kwargs_detmode['y']['inpainted_motion'].clone()
-    inpaint_motion_fixmode[:, -1] = -1.0
-    inpaint_cond_fixmode = (~inpainting_mask_fixmode) & rp_model_kwargs_detmode['attention_mask'].unsqueeze(-2)
+    inpaint_motion_fixmode = rp_model_kwargs_detmode['y']['inpainted_motion'].clone()  # 修复起点
+    inpaint_motion_fixmode[:, -1] = -1.0                                               # 标签通道占位
+    inpaint_cond_fixmode = (~inpainting_mask_fixmode) & rp_model_kwargs_detmode['attention_mask'].unsqueeze(-2)  # 待预测位置
 
-    rp_model_kwargs = batch_expander(model_kwargs, forward_rp_times)
-    rp_model_kwargs['y']['inpainting_mask'] = inpainting_mask_fixmode.clone()
-    rp_model_kwargs['y']['inpainted_motion'] = inpaint_motion_fixmode.clone()
-    rp_model_kwargs['inpaint_cond'] = inpaint_cond_fixmode.clone()
+    rp_model_kwargs = batch_expander(model_kwargs, forward_rp_times)                 # 扩展修复模式条件
+    rp_model_kwargs['y']['inpainting_mask'] = inpainting_mask_fixmode.clone()        # 写入修复掩码
+    rp_model_kwargs['y']['inpainted_motion'] = inpaint_motion_fixmode.clone()        # 写入修复起点
+    rp_model_kwargs['inpaint_cond'] = inpaint_cond_fixmode.clone()                   # 写入需预测位置
 
-    if args.enable_sits:
+    if args.enable_sits:                                                             # 可选软修复步调度
         soft_inpaint_ts = einops.repeat(_re_sample[:, [-1]], 'b c l -> b (repeat c) l', repeat=nfeats)
         soft_inpaint_ts = torch.clip((soft_inpaint_ts + 1 / 2), min=0.0, max=1.0)
         soft_inpaint_ts = torch.ceil((torch.sin(soft_inpaint_ts * torch.pi * 0.5)) * args.diffusion_steps).long()
@@ -215,40 +228,40 @@ def run_cleanup_selection(
         soft_inpaint_ts = None
 
     sample = sample_fn(
-        model,
-        (bs * forward_rp_times, nfeats, nframes),
-        clip_denoised=False,
-        model_kwargs=rp_model_kwargs,
-        skip_timesteps=args.skip_timesteps,  # 0 is default
-        init_image=rp_model_kwargs['y']['inpainted_motion'],
-        progress=True,
-        dump_steps=None,
-        noise=None,
-        const_noise=False,
-        soft_inpaint_ts=soft_inpaint_ts,
-        cond_fn=cond_fn if args.classifier_scale else None,
+        model,                                                       # 模型
+        (bs * forward_rp_times, nfeats, nframes),                    # 采样输出的形状（扩展后的 batch）
+        clip_denoised=False,                                         # 不额外裁剪去噪结果
+        model_kwargs=rp_model_kwargs,                                # 修复模式的条件（掩码、起点等）
+        skip_timesteps=args.skip_timesteps,  # 0 is default          # 可选跳过扩散步
+        init_image=rp_model_kwargs['y']['inpainted_motion'],         # 以修复起点作为初始图
+        progress=True,                                               # 显示进度
+        dump_steps=None,                                             # 不导出中间步
+        noise=None,                                                  # 默认随机噪声
+        const_noise=False,                                           # 不固定噪声
+        soft_inpaint_ts=soft_inpaint_ts,                             # 可选软修复步调度
+        cond_fn=cond_fn if args.classifier_scale else None,          # 可选 classifier guidance
     )
 
-    _inpaint_motion_detmode = sample.clone()
-    _inpaint_motion_detmode[:, -1] = 1.0  # For safety, corrupt the label from input.
-    rp_model_kwargs_detmode['y']['inpainted_motion'] = _inpaint_motion_detmode.clone()
+    _inpaint_motion_detmode = sample.clone()                         # 拷贝修复结果，用于后续检测模式评估
+    _inpaint_motion_detmode[:, -1] = 1.0                             # 将标签通道写为 1.0，占位防止带入原标签
+    rp_model_kwargs_detmode['y']['inpainted_motion'] = _inpaint_motion_detmode.clone()  # 更新检测模式的输入内容
 
-    score = 0
-    with torch.no_grad():
-        _re_t = torch.ones((bs * forward_rp_times,), device=dist_util.dev()) * 49
-        for _ in tqdm(range(eval_times)):  # quick det sampler
-            x = torch.randn_like(rp_model_kwargs_detmode['y']['inpainted_motion'])
-            inpaint_cond = rp_model_kwargs_detmode['inpaint_cond']
-            x_gt = rp_model_kwargs_detmode['y']['inpainted_motion']
-            x = torch.where(inpaint_cond, x, x_gt)
-            score += model(x, _re_t, **rp_model_kwargs_detmode)[:, -1]
-    score /= eval_times
-    score = torch.sum((score > 0.0) * rp_model_kwargs_detmode['attention_mask'], dim=-1)
-    score = einops.rearrange(score, "(repeat b) -> repeat b", repeat=forward_rp_times)  # [forward_rp_times, bs]
+    score = 0                                                                       # 初始化累积分数
+    with torch.no_grad():                                                           # 用检测模式为候选打分
+        _re_t = torch.ones((bs * forward_rp_times,), device=dist_util.dev()) * 49   # 固定时间步 49
+        for _ in tqdm(range(eval_times)):                                           # 多次快速检测打分
+            x = torch.randn_like(rp_model_kwargs_detmode['y']['inpainted_motion'])  # 随机噪声起点
+            inpaint_cond = rp_model_kwargs_detmode['inpaint_cond']                  # 待预测位置
+            x_gt = rp_model_kwargs_detmode['y']['inpainted_motion']                 # 已知位置的真值
+            x = torch.where(inpaint_cond, x, x_gt)                                  # 只在待预测位置保留噪声
+            score += model(x, _re_t, **rp_model_kwargs_detmode)[:, -1]              # 累加标签通道得分
+    score /= eval_times                                                             # 求均值，平滑噪声
+    score = torch.sum((score > 0.0) * rp_model_kwargs_detmode['attention_mask'], dim=-1)  # 对有效帧求和得分
+    score = einops.rearrange(score, "(repeat b) -> repeat b", repeat=forward_rp_times)     # 还原为 [forward_rp_times, bs]
 
-    sample_candidates = einops.rearrange(sample, "(repeat b) c l -> repeat b c l", repeat=forward_rp_times)
-    selected_id = torch.argmin(score, dim=0)  # [bs]
-    selected_id = selected_id[..., None, None].expand(sample_candidates.shape[1:]).unsqueeze(0)  # [1, bs, nfeats, nframes]
-    sample = torch.gather(sample_candidates, dim=0, index=selected_id).squeeze(0)
+    sample_candidates = einops.rearrange(sample, "(repeat b) c l -> repeat b c l", repeat=forward_rp_times)  # 重排候选 [repeat, bs, C, L]
+    selected_id = torch.argmin(score, dim=0)                                       # [bs] 选择分数最低的候选
+    selected_id = selected_id[..., None, None].expand(sample_candidates.shape[1:]).unsqueeze(0)  # 展开成索引形状
+    sample = torch.gather(sample_candidates, dim=0, index=selected_id).squeeze(0)  # 挑出对应的最佳候选
 
     return sample

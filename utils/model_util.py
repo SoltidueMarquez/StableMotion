@@ -10,6 +10,7 @@ def create_model_and_diffusion(args):
         num_attention_heads=args.heads, # default 8
         attention_head_dim=64,
         class_cond=True, # working mode indicator as class
+        # 提供这个参数就用用户指定的值，没有就默认关闭零初始化。
         zero_init=args.zero_init if hasattr(args, 'zero_init') else False,
     )
     
