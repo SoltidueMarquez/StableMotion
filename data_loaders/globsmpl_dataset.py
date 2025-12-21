@@ -3,6 +3,7 @@ import numpy as np
 import os
 import sys
 import random
+import glob
 import codecs as cs
 from tqdm import tqdm
 from torch.utils.data import Dataset
@@ -54,7 +55,18 @@ class AMASSMotionLoader:
     """
 
     def __init__(
-        self, base_dir, fps=20, disable: bool = False, ext=".npz", umin_s=5.0, umax_s=5.0, mode="train", **kwargs
+        self,
+        base_dir,
+        fps=20,
+        disable: bool = False,
+        ext=".npz",
+        umin_s=5.0,
+        umax_s=5.0,
+        mode="train",
+        sample_mode="random",
+        sequence_window_size=None,
+        sequence_stride=None,
+        **kwargs
     ):
         self.fps = fps
         self.base_dir = base_dir
@@ -65,6 +77,9 @@ class AMASSMotionLoader:
         assert self.umin > 0
         self.umax = int(self.fps * umax_s)
         self.mode = mode
+        self.sample_mode = sample_mode  # 修改点：记录当前裁剪模式（用于 __call__ 决定是否随机剪裁）
+        self.sequence_window_size = sequence_window_size
+        self.sequence_stride = sequence_stride
 
         j_regressor_stat = np.load("data_loaders/amasstools/smpl_neutral_nobetas_24J.npz")
         self.J_regressor = torch.from_numpy(j_regressor_stat["J"]).to(torch.double)
@@ -122,8 +137,13 @@ class AMASSMotionLoader:
             start = eval(path_meta[1])
             duration = eval(path_meta[2])
         else:
-            duration = random.randint(min(self.umin, mlen), min(self.umax, mlen))
-            start = random.randint(0, max(mlen - duration, 0))
+            if self.sample_mode in ["sequential", "full", "folder"]:
+                # 顺序模式下始终返回整段，不再做随机裁剪
+                start = 0
+                duration = mlen
+            else:
+                duration = random.randint(min(self.umin, mlen), min(self.umax, mlen))
+                start = random.randint(0, max(mlen - duration, 0))
 
         poses = poses[start : start + duration]
         trans = trans[start : start + duration]
@@ -175,7 +195,16 @@ class MotionDataset(Dataset):
     Thin dataset wrapper around a motion loader callable.
     """
 
-    def __init__(self, motion_loader, split: str = "train", preload: bool = False, skip_missing: bool = True):
+    def __init__(
+        self,
+        motion_loader,
+        split: str = "train",
+        preload: bool = False,
+        skip_missing: bool = True,
+        sample_mode: str = "random",
+        sequence_window_size=None,
+        sequence_stride=None,
+    ):
         """
         初始化数据集
         
@@ -187,6 +216,9 @@ class MotionDataset(Dataset):
         """
         self.collate_fn = collate_motion
         self.split = split
+        self.sample_mode = sample_mode  # 传递下来以便后续调试/扩展（目前主要用于调试变量）
+        self.sequence_window_size = sequence_window_size
+        self.sequence_stride = sequence_stride
         all_keyids = read_split("data_loaders", split)
         self.motion_loader = motion_loader
         self.is_training = "train" in split
@@ -277,6 +309,42 @@ class MotionDataset(Dataset):
         except (FileNotFoundError, RuntimeError) as e:
             # 重新抛出异常，让调用者知道哪个文件有问题
             raise RuntimeError(f"加载样本失败 {keyid}: {e}") from e
+
+
+class FolderMotionDataset(Dataset):
+    """
+    直接遍历某个文件夹下的 motion 文件，按顺序返回原始 clip（不裁剪）。
+    """
+
+    def __init__(self, motion_loader, folder_path, extensions=(".npz", ".npy")):
+        self.collate_fn = collate_motion
+        self.motion_loader = motion_loader
+        self.folder_path = os.path.abspath(folder_path)
+        if not os.path.isdir(self.folder_path):
+            raise FileNotFoundError(f"指定的 motion 文件夹不存在: {self.folder_path}")
+
+        files = []
+        for ext in extensions:
+            files.extend(
+                glob.glob(os.path.join(self.folder_path, "**", f"*{ext}"), recursive=True)
+            )
+        files = sorted(set(files))
+        if not files:
+            raise FileNotFoundError(f"在文件夹 {self.folder_path} 中未找到任何 motion 文件 ({extensions})")
+
+        rel_paths = []
+        for path in files:
+            rel = os.path.relpath(path, self.motion_loader.base_dir).replace(os.sep, "/")
+            rel = os.path.splitext(rel)[0]
+            rel_paths.append(rel)
+        self.keyids = rel_paths
+
+    def __len__(self):
+        return len(self.keyids)
+
+    def __getitem__(self, index):
+        keyid = self.keyids[index]
+        return self.motion_loader(path=keyid)
 
 
 if __name__ == "__main__":

@@ -69,7 +69,11 @@ if __name__ == '__main__':
             if _gen_labels is not None:
                 gen_labels = []
                 for glst in _gen_labels:
-                    gen_labels += glst.tolist()
+                    array = np.asarray(glst)
+                    if array.ndim == 0:
+                        gen_labels.append([bool(array)])
+                    else:
+                        gen_labels.append(array.tolist())
             lengths = datas['lengths']
             n_motions = len(smpldatas)
             vext = ".mp4"
