@@ -158,8 +158,11 @@ def process_long_sequence(
     #endregion
 
     #region 结果缓冲：累加每帧的修复、检测特征并记录覆盖次数
+    # 把每帧从各个窗口修复出的结果加起来，再记录每帧被多少个窗口覆盖，后面会用它们做除法得到融合后的输出（防止重叠区域抖动）。
     result_accum = torch.zeros((nfeats, seq_len), device=device)  # 每帧修复输出累加
     result_counts = torch.zeros((seq_len,), device=device)  # 记录每帧被多少窗口覆盖
+
+    # 同样逻辑但用于检测分支返回的特征，方便后续把多个窗口的检测特征融合成一条连续流。
     det_accum = torch.zeros((nfeats, seq_len), device=device)  # 检测分支特征累加
     det_counts = torch.zeros((seq_len,), device=device)  # 检测特征覆盖次数
     label_buffer = torch.zeros((seq_len,), dtype=torch.bool, device=device)  # 最终标签（有坏帧）
@@ -200,7 +203,9 @@ def process_long_sequence(
         target_end_in_window = context_frames + target_len
         window_input[:, :, target_start:target_end_in_window] = seq_data[:, start:target_end].unsqueeze(0)
         window_attn[:, target_start:target_end_in_window] = True
+        # endregion
 
+        #region 将未来帧填入 context 之后的区域
         if future_len > 0:
             future_start = target_end_in_window
             future_end = future_start + future_len
@@ -208,7 +213,10 @@ def process_long_sequence(
             window_attn[:, future_start:future_end] = True
         #endregion
 
-        #region 用检测分支预测当前窗口中的坏帧标签（标签通道），其余通道固定 context/输入值
+        #region ===============================检测=======================================
+        # 用检测分支预测当前窗口中的坏帧标签（标签通道），不只取当前窗口做检测是需要用来对未来帧进行attention遮盖处理才能输入修复模型
+        # 输入input_motions是 上文的序列帧数 + 当前窗口的帧 + 未来帧
+        # 输入attention_mask是 上文的序列帧数 + 当前窗口的帧 + 未来帧
         det_out = detect_labels(
             model=model,
             diffusion=diffusion,
@@ -220,15 +228,16 @@ def process_long_sequence(
         )
         #endregion
 
-        #region 只提取当前目标帧的标签部分，context 位置无需覆盖
-        label = det_out["label"].to(device)  # 取出检测分支预测的 label 张量
-        label[:, :context_frames] = False  # 上下文部分不应该被标记
+        #region 只提取当前目标帧的标签部分，context与future 位置无需label，用attention遮掉损坏的未来帧
+        label = det_out["label"].to(device)     # 取出检测分支预测的 label 张量
+        label[:, :context_frames] = False       # 上下文部分不应该被标记
         if target_len < window_size:
             label[:, context_frames + target_len:] = False  # 窗口未满时忽略尾部填充
-        target_label = label[0, context_frames:context_frames + target_len]  # 只保留本窗口目标帧
+        # 这两行是用于后续可视化的
+        target_label = label[0, context_frames:context_frames + target_len]  # 这里直接截取了 label 中从 context_frames 开始、长度为当前窗口目标帧数的切片只保留本窗口目标帧
         label_buffer[start:target_end] |= target_label  # 记录坏帧标签，多个窗口取或保持坏帧
         
-        # 处理未来帧的标签，确保未来帧不被作为上下文污染
+        # 处理未来帧的标签，确保损坏的未来帧不被作为上下文污染
         if future_len > 0:
             future_bad = label[0, future_start:future_end]
             if future_bad.any():
@@ -238,13 +247,17 @@ def process_long_sequence(
                 label[:, future_start:future_end] &= keep_future
         #endregion
 
-        #region 运行修复分支，使用检测标签指导生成替换帧
+        #region ===============================修复=======================================
+        #运行修复分支，使用检测标签指导生成替换帧
+        # 这边的实际输入是 40上文帧+100当前窗口+40下文帧，
+        # 但是因为上文和下文都经过了处理，要么不是损坏要么被attentionmask遮住，所以只会修复当前窗口中损坏的帧
+        # 这边的输出是包含了没有变化的上文和下文的，最终写回累加的时候只有当前窗口的目标帧会被累加/平均
         fix_out = fix_motion(
             model=model,                    # 传入同一个 diffusion 模型
             diffusion=diffusion,            # 采样器
             args=args,                      # 配置参数
-            input_motions=window_input,     # 包含 context + 当前目标帧
-            length=length_tensor,           # 有效帧数（context + target） [B]，每条序列的有效帧长度
+            input_motions=window_input,     # 包含 context + 当前目标帧 + future
+            length=length_tensor,           # 有效帧数（context + target + future） [B]，每条序列的有效帧长度
             attention_mask=window_attn,     # [B, N] bool，标记有效帧区域
             motion_normalizer=motion_normalizer,  # 用于特征归一化/反归一化的工具
             label=label,                     # [B, N] bool，检测阶段得到的坏帧标记
@@ -254,9 +267,9 @@ def process_long_sequence(
         #endregion
 
         #region 累加当前窗口 result，后续通过 counts 计算平均（避免 overlapping 处偏移）
-        sample_fix_feats = fix_out["sample_fix_feats"][0]  # 修复分支每帧输出（含 context）
+        sample_fix_feats = fix_out["sample_fix_feats"][0]  # 修复分支每帧输出（含 context和future）
         det_feats = det_out["re_sample_det_feats"][0]  # 检测分支的辅助特征，后面也要融合
-        target_slice = slice(context_frames, context_frames + target_len)  # 提取当前目标帧
+        target_slice = slice(context_frames, context_frames + target_len)  # 提取当前目标帧（从context_frames开始，长度为target_len）
         result_accum[:, start:target_end] += sample_fix_feats[:, target_slice]  # 累加目标帧特征
         result_counts[start:target_end] += 1  # 记录每帧被累积的次数，用于后续平均
         det_accum[:, start:target_end] += det_feats[:, target_slice]  # 检测特征也同样累加
@@ -264,6 +277,8 @@ def process_long_sequence(
         #endregion
 
     #region 将重叠帧的累积值除以覆盖次数，得到融合后的结果
+    # 这边是因为设置了window_stride，
+    # 也就是说有可能第一个窗口是0-100，第二个窗口是60-160，中间重叠的40需要取平均
     safe_denom_fix = result_counts.clamp(min=1.0)  # 避免除零，保证每帧至少除以1
     safe_denom_det = det_counts.clamp(min=1.0)  # 同理，检测特征的计数
     final_fix = result_accum / safe_denom_fix.unsqueeze(0)  # 每帧修复结果除以覆盖次数，融合重叠窗口
