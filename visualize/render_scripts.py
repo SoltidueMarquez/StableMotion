@@ -66,6 +66,7 @@ if __name__ == '__main__':
                 _gen_labels = datas.get('gt_labels', None)
             else:
                 _gen_labels = datas.get('label', None)
+            gen_labels = None
             if _gen_labels is not None:
                 gen_labels = []
                 for glst in _gen_labels:
@@ -97,11 +98,15 @@ if __name__ == '__main__':
                         vertices = output["vertices"][:lengths[idx]]
                         # print(np.min(vertices, axis=(0,1)))
                         vertices[..., 2] -= np.min(vertices[..., 2])
-                        smpl_renderer(
+                    smpl_renderer(
                                     vertices, 
                                     title="", 
                                     output=smpl_video_paths[idx], 
-                                    gen_label=gen_labels[idx][:lengths[idx]] if _gen_labels is not None else None
+                                    gen_label=(
+                                        gen_labels[idx][:lengths[idx]]
+                                        if gen_labels is not None and idx < len(gen_labels)
+                                        else None
+                                    )
                                 )
                 else:
                     os.makedirs(os.path.dirname(joints_video_paths[idx]), exist_ok=True)

@@ -99,11 +99,16 @@ def viz_smpl_seq(
                 _gen_vertex_colors = np.concatenate([gen_vertex_colors[:, :3], vtx_alpha], axis=1)
             else:
                 _gen_vertex_colors = gen_vertex_colors
+            label_flag = (
+                bool(gen_label[i])
+                if isinstance(gen_label, (list, np.ndarray)) and i < len(gen_label)
+                else False
+            )
             body_mesh_seq.append(
             trimesh.Trimesh(
                 vertices=c2c(body.v[i]),
                 faces=faces,
-                vertex_colors=_gen_vertex_colors if gen_label[i] else vertex_colors,
+                vertex_colors=_gen_vertex_colors if label_flag else vertex_colors,
                 process=False,
             ))
 

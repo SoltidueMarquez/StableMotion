@@ -53,13 +53,13 @@ def long_args():
         type=int,
         default=0,
         help="可选：每个窗口后向延伸多少帧作为已知上下文（用于边界平滑）。",
-    )
+    ) # 每个窗口后向延伸多少帧作为已知上下文（用于边界平滑）。
     parser.add_argument(
         "--folder_path",
         type=str,
         default="",
         help="可选：直接从某个文件夹遍历 motion，避免用 split 文件。",
-    )
+    ) # 可选：直接从某个文件夹遍历 motion，避免用 split 文件。
     return parse_and_load_from_model(parser)
 
 
@@ -227,6 +227,15 @@ def process_long_sequence(
             label[:, context_frames + target_len:] = False  # 窗口未满时忽略尾部填充
         target_label = label[0, context_frames:context_frames + target_len]  # 只保留本窗口目标帧
         label_buffer[start:target_end] |= target_label  # 记录坏帧标签，多个窗口取或保持坏帧
+        
+        # 处理未来帧的标签，确保未来帧不被作为上下文污染
+        if future_len > 0:
+            future_bad = label[0, future_start:future_end]
+            if future_bad.any():
+                keep_future = ~future_bad.unsqueeze(0)
+                # 把检测到的坏未来帧从 attention 中屏蔽，避免作为上下文污染当前窗口
+                window_attn[:, future_start:future_end] &= keep_future
+                label[:, future_start:future_end] &= keep_future
         #endregion
 
         #region 运行修复分支，使用检测标签指导生成替换帧
