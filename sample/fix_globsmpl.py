@@ -138,6 +138,8 @@ def fix_motion(
     label,                   # [B, N] bool，检测阶段得到的坏帧标记
     re_sample_det_feats,     # [B, C, N] 检测阶段的采样特征，用于软修复调度
     cond_fn=None,            # 可选 classifier guidance 函数
+    label_for_cleanup=None,
+    re_sample_det_feats_for_cleanup=None,
 ):
     """
     修复阶段（Fix pass）：
@@ -225,6 +227,8 @@ def fix_motion(
             nframes=nframes,
             sample_fn=sample_fn,
             cond_fn=cond_fn if args.classifier_scale else None,  # 可选 classifier 指引
+            precomputed_label=label_for_cleanup,
+            precomputed_re_sample=re_sample_det_feats_for_cleanup,
         )
     else:
         # 常规单次修复采样

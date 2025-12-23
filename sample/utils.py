@@ -154,6 +154,8 @@ def run_cleanup_selection(
     bs,                    # batch 大小
     nfeats,                # 通道数
     nframes,               # 帧数
+    precomputed_label=None,       # 可选：上游检测阶段的坏帧布尔掩码
+    precomputed_re_sample=None,   # 可选：与 precomputed_label 对应的重采样特征（模型归一化空间）
 ):
     """
     封装检测→修复的集成流程：
@@ -175,21 +177,33 @@ def run_cleanup_selection(
     # 把输出累加后取平均，目的是降低单次检测的随机波动，得到更稳定的检测结果；
     # 随后反归一化并在标签通道做阈值，得到坏帧布尔掩码。
     # 也就是在检测模式下做多次快速前向，得到平均检测结果
-    with torch.no_grad():                                      # 检测模式下快速均值
-        _re_sample = 0                                         # 累积检测输出，与模型在该时间步的输出一致，[bs * forward_rp_times, nfeats, nframes]。
-        _re_t = torch.ones((bs * forward_rp_times,), device=dist_util.dev()) * 49  # 固定时间步
-        for _ in tqdm(range(eval_times)):                      # 多次快速检测采样
-            x = torch.randn_like(rp_model_kwargs_detmode['y']['inpainted_motion'])  # 随机噪声起点
-            inpaint_cond = rp_model_kwargs_detmode['inpaint_cond']                  # 需要预测的位置
-            x_gt = rp_model_kwargs_detmode['y']['inpainted_motion']                 # 已知位置填原值
-            x = torch.where(inpaint_cond, x, x_gt)                                  # 只在待预测位置保持噪声
-            _re_sample += model(x, _re_t, **rp_model_kwargs_detmode)                # 前向得到检测输出
-        _re_sample = _re_sample / eval_times                                        # 求均值，降低方差
 
-    # 之前的 _re_sample 还在“模型归一化空间”——训练时输入被 mean/std 标准化，模型输出也在同一尺度里。
-    # 现在需要反归一化到物理尺度，才能与真实运动数据对比。
-    _sample = motion_normalizer.inverse(_re_sample.transpose(1, 2).cpu())           # 反归一化到原尺度
-    _label = _sample[..., -1] > args.ProbDetTh                                      # 标签通道阈值化，得到坏帧布尔
+    if precomputed_re_sample is None :
+        with torch.no_grad():                                      # 检测模式下快速均值
+            _re_sample = 0                                         # 累积检测输出，与模型在该时间步的输出一致，[bs * forward_rp_times, nfeats, nframes]。
+            _re_t = torch.ones((bs * forward_rp_times,), device=dist_util.dev()) * 49  # 固定时间步
+            for _ in tqdm(range(eval_times)):                      # 多次快速检测采样
+                x = torch.randn_like(rp_model_kwargs_detmode['y']['inpainted_motion'])  # 随机噪声起点
+                inpaint_cond = rp_model_kwargs_detmode['inpaint_cond']                  # 需要预测的位置
+                x_gt = rp_model_kwargs_detmode['y']['inpainted_motion']                 # 已知位置填原值
+                x = torch.where(inpaint_cond, x, x_gt)                                  # 只在待预测位置保持噪声
+                _re_sample += model(x, _re_t, **rp_model_kwargs_detmode)                # 前向得到检测输出
+            _re_sample = _re_sample / eval_times                                        # 求均值，降低方差
+
+        # 之前的 _re_sample 还在“模型归一化空间”——训练时输入被 mean/std 标准化，模型输出也在同一尺度里。
+        # 现在需要反归一化到物理尺度，才能与真实运动数据对比。
+        _sample = motion_normalizer.inverse(_re_sample.transpose(1, 2).cpu())           # 反归一化到原尺度
+    else :
+        _re_sample = precomputed_re_sample.clone()
+        _re_sample = einops.repeat(_re_sample, "b c l -> (repeat b) c l", repeat=forward_rp_times).clone().contiguous()
+
+
+    if precomputed_label is None :
+        _label = _sample[..., -1] > args.ProbDetTh                                      # 标签通道阈值化，得到坏帧布尔
+    else :
+        _label = precomputed_label.clone()
+        _label = einops.repeat(_label, "b l -> (repeat b) l", repeat=forward_rp_times).clone().contiguous().cpu()
+
 
     # -------------------------------
     # Preparing for Fixing Mode

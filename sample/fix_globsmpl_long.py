@@ -263,6 +263,10 @@ def process_long_sequence(
             label=label,                     # [B, N] bool，检测阶段得到的坏帧标记
             re_sample_det_feats=det_out["re_sample_det_feats"],  # [B, C, N] 检测阶段的采样特征，用于软修复调度
             cond_fn=cond_fn,                 # 可选 classifier guidance 函数
+            
+            # # 这边强制走构造好的label
+            label_for_cleanup=label,
+            re_sample_det_feats_for_cleanup=det_out["re_sample_det_feats"]
         )
         #endregion
 
