@@ -60,6 +60,11 @@ def long_args():
         default="",
         help="可选：直接从某个文件夹遍历 motion，避免用 split 文件。",
     ) # 可选：直接从某个文件夹遍历 motion，避免用 split 文件。
+    parser.add_argument(
+        "--use_precomputed_cleanup",
+        action="store_true",
+        help="是否将检测输出的 label/re_sample 传给 ensemble clean-up。",
+    )
     return parse_and_load_from_model(parser)
 
 
@@ -252,22 +257,24 @@ def process_long_sequence(
         # 这边的实际输入是 40上文帧+100当前窗口+40下文帧，
         # 但是因为上文和下文都经过了处理，要么不是损坏要么被attentionmask遮住，所以只会修复当前窗口中损坏的帧
         # 这边的输出是包含了没有变化的上文和下文的，最终写回累加的时候只有当前窗口的目标帧会被累加/平均
-        fix_out = fix_motion(
-            model=model,                    # 传入同一个 diffusion 模型
-            diffusion=diffusion,            # 采样器
-            args=args,                      # 配置参数
-            input_motions=window_input,     # 包含 context + 当前目标帧 + future
-            length=length_tensor,           # 有效帧数（context + target + future） [B]，每条序列的有效帧长度
-            attention_mask=window_attn,     # [B, N] bool，标记有效帧区域
-            motion_normalizer=motion_normalizer,  # 用于特征归一化/反归一化的工具
-            label=label,                     # [B, N] bool，检测阶段得到的坏帧标记
-            re_sample_det_feats=det_out["re_sample_det_feats"],  # [B, C, N] 检测阶段的采样特征，用于软修复调度
-            cond_fn=cond_fn,                 # 可选 classifier guidance 函数
-            
-            # # 这边强制走构造好的label
-            label_for_cleanup=label,
-            re_sample_det_feats_for_cleanup=det_out["re_sample_det_feats"]
+        fix_kwargs = dict(
+            model=model,
+            diffusion=diffusion,
+            args=args,
+            input_motions=window_input,
+            length=length_tensor,
+            attention_mask=window_attn,
+            motion_normalizer=motion_normalizer,
+            label=label,
+            re_sample_det_feats=det_out["re_sample_det_feats"],
+            cond_fn=cond_fn,
         )
+        if args.use_precomputed_cleanup:
+            fix_kwargs.update(
+                label_for_cleanup=label,
+                re_sample_det_feats_for_cleanup=det_out["re_sample_det_feats"],
+            )
+        fix_out = fix_motion(**fix_kwargs)
         #endregion
 
         #region 累加当前窗口 result，后续通过 counts 计算平均（避免 overlapping 处偏移）
