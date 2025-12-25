@@ -433,6 +433,7 @@ class StableMotionDiTModel(ModelMixin, ConfigMixin):
         )
         
         # Rotary positional embedding for 1D sequence
+        # 生成 1D rotary positional embedding，用于 self-attention 中在特征维度上模拟位置信息
         rotary_embedding = get_1d_rotary_pos_embed(
             self.rotary_embed_dim,
             hidden_states.shape[-2],
@@ -440,9 +441,9 @@ class StableMotionDiTModel(ModelMixin, ConfigMixin):
             repeat_interleave_real=False,
         )
 
-        # Transformer stack
-        for block in self.transformer_blocks:
+        for block in self.transformer_blocks:  # 逐层迭代每个 transformer block
             if self.training and self.gradient_checkpointing:
+                # 如果开启梯度检查点则构造自定义 forward 函数，避免预先展开返回 dict
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
                         if return_dict is not None:
@@ -451,23 +452,26 @@ class StableMotionDiTModel(ModelMixin, ConfigMixin):
                             return module(*inputs)
                     return custom_forward
 
+                # Grad checkpoint 需要明确 use_reentrant，根据 torch 版本决定
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                # 使用 checkpoint 包裹 block，节省显存但需传入所有非默认参数
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     hidden_states,
                     attention_mask,
-                    None, #cross_attention_hidden_states,
-                    None, #encoder_attention_mask,
+                    None,  # cross_attention_hidden_states
+                    None,  # encoder_attention_mask
                     rotary_embedding,
-                    time_hidden_states
+                    time_hidden_states,
                     **ckpt_kwargs,
                 )
             else:
+                # 常规执行 block 的 forward，传入 rotary 与时间调制信息
                 hidden_states = block(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
-                    encoder_hidden_states=None, #cross_attention_hidden_states,
-                    encoder_attention_mask=None, #encoder_attention_mask,
+                    encoder_hidden_states=None,  # cross_attention_hidden_states
+                    encoder_attention_mask=None,  # encoder_attention_mask
                     rotary_embedding=rotary_embedding,
                     time_hidden_states=time_hidden_states,
                 )
