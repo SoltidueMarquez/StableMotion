@@ -9,13 +9,16 @@ Smart detection pipeline for sliding-window-long globsmpl motions.
 import os
 from argparse import ArgumentParser
 
+import math
+
 import numpy as np
 import torch
 
 from ema_pytorch import EMA
 
-from sample.fix_globsmpl import detect_labels
+from sample.fix_globsmpl import detect_labels, fix_motion
 from sample.utils import build_output_dir, prepare_cond_fn
+from data_loaders.amasstools.globsmplrifke_feats import globsmplrifkefeats_to_smpldata
 from data_loaders.get_data import get_dataset_loader
 from utils.fixseed import fixseed
 from utils.model_util import create_model_and_diffusion
@@ -37,7 +40,8 @@ def smart_args():
         help="每个滑窗的 target 部分帧数，同时决定 stride (等于 target_window)。",
     )
     parser.add_argument(
-        "--context_frames",
+        "--history_frames",
+        dest="history_frames",
         type=int,
         default=20,
         help="history 和 future 的帧数（对称），只作为上下文不会直接被标注。",
@@ -53,7 +57,19 @@ def smart_args():
         action="store_true",
         help="调试用：打印每条序列的坏帧闭区间。",
     )
+    parser.add_argument(
+        "--fix_direction",
+        choices=["ltr", "rtl"],
+        default="ltr",
+        help="修复时窗口遍历方向。",
+    )
+    parser.add_argument(
+        "--use_precomputed_cleanup",
+        action="store_true",
+        help="在 run_section 中复用 detection 结果作为进一步上下文（默认关闭）。",
+    )
     return parse_and_load_from_model(parser)
+
 
 
 def compute_target_starts(seq_len: int, target_size: int):
@@ -84,7 +100,28 @@ def build_corrupt_intervals(mask):
         intervals.append((start + 1, len(mask)))
     return intervals
 
+
+def build_corrupt_intervals_zero(mask):
+    """
+    把 bool 掩码转换成 [start,end) 的闭区间列表，便于按区间修复。
+    """
+    intervals = []
+    start = None
+    for idx, flag in enumerate(mask):
+        if flag:
+            if start is None:
+                start = idx
+        elif start is not None:
+            intervals.append((start, idx))
+            start = None
+    if start is not None:
+        intervals.append((start, len(mask)))
+    return intervals
+
 def format_intervals(intervals):
+    """
+    把 [start,end] 区间列表拼成易读的字符串，比如 "[[1,5],[10,12]]"。
+    """
     if not intervals:
         return "[]"
     return "[" + ",".join(f"[{s},{e}]" for s, e in intervals) + "]"
@@ -111,7 +148,7 @@ def detect_sequence_quality_labels(
 
     seq_data = input_sequence[:, :seq_len]  # 丢弃 padding，只保留真实有效帧
     target_size = args.target_window  # target 区域的帧数（同时也是 stride）
-    history_frames = args.context_frames  # history/future 各自的帧数
+    history_frames = args.history_frames  # history/future 各自的帧数
     future_frames = history_frames  # 强制未来帧与 history 保持对称
     #endregion
 
@@ -188,6 +225,243 @@ def detect_sequence_quality_labels(
     return label_buffer
 
 
+def gather_context(
+    *,
+    fix_out,
+    window_input,
+    window_attn,
+    history_frames,
+    history_start,
+    history_len,
+    future_start,
+    future_len,
+    window_target_len,
+):
+    """
+    填充 history/future 段数据，并用 fix_out 的标签通道屏蔽仍旧损坏的帧。
+    """
+    device = window_attn.device
+    fix_labels = fix_out[-1]
+
+    if history_len > 0:
+        history_offset = history_frames - history_len
+        history_slice = fix_out[:, history_start : history_start + history_len].unsqueeze(0)
+        window_input[:, :, history_offset:history_frames] = history_slice
+        history_valid = (~fix_labels[history_start : history_start + history_len].to(torch.bool)).to(device)
+        window_attn[:, history_offset:history_frames] = history_valid.unsqueeze(0)
+
+    future_offset = history_frames + window_target_len
+    if future_len > 0:
+        future_slice = fix_out[:, future_start : future_start + future_len].unsqueeze(0)
+        window_input[:, :, future_offset : future_offset + future_len] = future_slice
+        future_valid = (~fix_labels[future_start : future_start + future_len].to(torch.bool)).to(device)
+        window_attn[:, future_offset : future_offset + future_len] = future_valid.unsqueeze(0)
+
+
+@torch.no_grad()
+def fix_sequence_with_labels(
+    *,
+    model,
+    diffusion,
+    args,
+    motion_normalizer,
+    input_sequence,
+    length,
+    device,
+    label_buffer,
+    cond_fn,
+    direction="ltr",
+):
+    """
+    基于 label_buffer 的坏帧，按滑窗策略逐段运行 fix_motion。
+    """
+    seq_len = int(length.item()) # 将长度 tensor 提取成 python int，方便后续切片
+    nfeats = input_sequence.shape[0] # 每帧通道数（包含标签）
+    if seq_len == 0:
+        # 空序列没有帧需要修复，立即返回一个空的修复输出
+        return {"fixed_feats": input_sequence[:, :0].clone()}
+
+    # region 初始化
+    seq_data = input_sequence[:, :seq_len] # 获取输入数据
+    label_mask = label_buffer[:seq_len].to(device) # 获取标签
+    target_window = max(1, args.target_window) # 确保 target_window 至少为 1
+    history_frames = args.history_frames # 历史帧数
+    future_frames = history_frames # 未来帧数
+    intervals = build_corrupt_intervals_zero(label_mask.cpu().numpy()) # 构建坏帧区间列表
+    if direction == "rtl":
+        intervals = list(reversed(intervals)) # 反向遍历坏帧区间
+    if not intervals:
+        return {"fixed_feats": seq_data.clone()} # 没有坏帧需要修复，直接返回原始序列
+    
+    # 初始化修复输出，每次修复都会更新
+    final_fix = seq_data.clone() # 默认先用原始序列填充
+    fix_out = seq_data.clone()
+    fix_out[-1, :seq_len] = label_mask.to(fix_out.dtype)
+    #endregion
+
+    #region 如果run_section使用model前向，则可能导致修复上下文，因此需要累加结果，否则直接使用原始序列
+    use_aggregation = not args.use_precomputed_cleanup
+    if use_aggregation:
+        result_accum = torch.zeros((nfeats, seq_len), device=device)
+        result_counts = torch.zeros((seq_len,), device=device)
+    #endregion
+
+    # 修复逻辑是：先获取坏帧区间，根据坏帧区间获取目标窗口，
+    # 根据目标窗口获取历史窗口和未来窗口，和目标窗口，
+    # 然后根据输入窗口获取输出窗口获取修复结果
+    for interval_start, interval_end in intervals: # 遍历每个坏帧区间
+        interval_len = interval_end - interval_start
+        if interval_len <= 0:
+            continue
+
+        #region 计算目标窗口，如果坏帧区间比 target_window 短，窗口就是 target_window；如果坏帧区间更长，就把窗口拉长到相同长度且
+        window_target_len = max(target_window, interval_len) # 确保目标窗口长度至少为 target_window
+        center = (interval_start + interval_end) / 2 # 计算目标窗口中心点，对齐中心
+        raw_start = int(math.floor(center - window_target_len / 2 + 0.5)) # 计算目标窗口起始点
+        target_start = max(0, min(raw_start, seq_len - window_target_len)) # 确保目标窗口起始点不越界
+        target_end = target_start + window_target_len # 确保目标窗口结束点不越界
+        if target_start > interval_start:
+            target_start = interval_start # 确保目标窗口起始点不越界
+            target_end = target_start + window_target_len # 确保目标窗口结束点不越界
+        if target_end < interval_end:
+            target_end = interval_end # 确保目标窗口结束点不越界    
+            target_start = max(0, target_end - window_target_len) # 确保目标窗口起始点不越界
+            target_end = target_start + window_target_len # 确保目标窗口结束点不越界
+        window_target_len = target_end - target_start # 确保目标窗口长度不小于0
+        if window_target_len <= 0:
+            continue
+        #endregion
+
+        #region 计算历史窗口和未来窗口
+        history_start = max(0, target_start - history_frames) # 确保历史窗口起始点不越界
+        history_len = target_start - history_start # 确保历史窗口长度不小于0
+        future_start = target_end # 确保未来窗口起始点不越界
+        future_end = min(seq_len, future_start + future_frames) # 确保未来窗口结束点不越界
+        future_len = future_end - future_start # 确保未来窗口长度不小于0
+        #endregion
+
+        #region 初始化输入窗口和注意力掩码
+        window_frames = history_frames + window_target_len + future_frames # 确保窗口总长度为上文+目标+下文
+        window_input = torch.zeros((1, nfeats, window_frames), device=device) # 初始化输入窗口
+        window_attn = torch.zeros((1, window_frames), dtype=torch.bool, device=device) # 初始化注意力掩码
+        #endregion
+
+        #region 填充历史窗口和未来窗口
+        gather_context(
+            fix_out=fix_out,
+            window_input=window_input,
+            window_attn=window_attn,
+            history_frames=history_frames,
+            history_start=history_start,
+            history_len=history_len,
+            future_start=future_start,
+            future_len=future_len,
+            window_target_len=window_target_len,
+        )
+        #endregion
+
+        #region 填充目标窗口
+        target_slice_start = history_frames
+        target_slice_end = target_slice_start + window_target_len
+        window_input[:, :, target_slice_start:target_slice_end] = fix_out[
+            :, target_start:target_end
+        ].unsqueeze(0)
+        window_attn[:, target_slice_start:target_slice_end] = True
+        #endregion
+
+        #region 初始化标签掩码
+        label_mask = torch.zeros((1, window_frames), dtype=torch.bool, device=device)
+        label_slice_start = history_frames
+        label_slice_end = history_frames + window_target_len
+        label_mask[:, label_slice_start:label_slice_end] = fix_out[
+            -1, target_start:target_end
+        ].to(torch.bool).unsqueeze(0)
+        #endregion
+
+        #region 初始化长度张量
+        length_tensor = torch.tensor(
+            [history_len + window_target_len + future_len], device=device, dtype=length.dtype
+        )
+        #endregion
+
+        #region 执行检测
+        det_out = detect_labels(
+            model=model,
+            diffusion=diffusion,
+            args=args,
+            input_motions=window_input,
+            length=length_tensor,
+            attention_mask=window_attn,
+            motion_normalizer=motion_normalizer,
+        )
+        #endregion
+
+        #region 执行修复
+        fix_kwargs = dict(
+            model=model,
+            diffusion=diffusion,
+            args=args,
+            input_motions=window_input,
+            length=length_tensor,
+            attention_mask=window_attn,
+            motion_normalizer=motion_normalizer,
+            label=label_mask,
+            re_sample_det_feats=det_out["re_sample_det_feats"],
+            cond_fn=cond_fn,
+        )
+        if args.use_precomputed_cleanup:
+            fix_kwargs.update(
+                label_for_cleanup=label_mask,
+                re_sample_det_feats_for_cleanup=det_out["re_sample_det_feats"],
+            )
+
+        fix_result = fix_motion(**fix_kwargs)
+        fix_feats = fix_result["sample_fix_feats"][0]
+        #endregion
+
+        #region 更新修复输出
+        interval_slice = slice(label_slice_start, label_slice_end)
+        fixed_target_segment = fix_feats[:, interval_slice]
+        target_relative_start = interval_start - target_start
+        target_relative_end = target_relative_start + interval_len
+        fixed_segment = fixed_target_segment[
+            :, target_relative_start:target_relative_end
+        ]
+        # 如果允许 granular aggregation，则在累加器里累加当前段的修复结果
+        if use_aggregation:
+            result_accum[:, interval_start:interval_end] += fixed_segment
+            result_counts[interval_start:interval_end] += 1
+            counts_slice = result_counts[interval_start:interval_end].clamp(min=1.0)
+            averaged = result_accum[:, interval_start:interval_end] / counts_slice.unsqueeze(0)
+            # 把平均结果写回修复缓冲，用于后续窗口的上下文
+            fix_out[:, interval_start:interval_end] = averaged
+        else:
+            # 不聚合时直接把结果写入最终输出，也同步更新 fix_out 以便 context 复用
+            final_fix[:, interval_start:interval_end] = fixed_segment
+            fix_out[:, interval_start:interval_end] = fixed_segment
+
+        # 修复后目标段不再被视作坏帧（在窗口范围内）
+        local_interval_start = history_frames + max(0, interval_start - target_start)
+        local_interval_end = local_interval_start + interval_len
+        label_mask[0, local_interval_start:local_interval_end] = False
+        # 把标签通道同步写回 fix_out，保持通道与实际好帧状态一致
+        fix_out[-1, interval_start:interval_end] = label_mask[
+            0, local_interval_start:local_interval_end
+        ].to(fix_out.dtype)
+        #endregion
+
+    #region 处理累积结果
+    if use_aggregation:
+        missing_mask = result_counts == 0
+        if missing_mask.any():
+            result_accum[:, missing_mask] = seq_data[:, missing_mask]
+            result_counts[missing_mask] = 1
+        final_fix = result_accum / result_counts.clamp(min=1.0).unsqueeze(0)
+    #endregion
+
+    return {"fixed_feats": final_fix}
+
+
 def main():
     #region 解析参数并固定随机
     args = smart_args()
@@ -240,6 +514,8 @@ def main():
     all_input_motions_vec = []  # 存储修复前的原始特征
     labels = []                 # 存储最终的坏帧标签
     gt_labels_buf = []          # 存储 GT 帧级标签
+    all_motions_fix = []        # 存储修复后的 SMPL 字典
+    all_fix_motions_vec = []    # 存储修复后的特征
     total_samples = 0           # 总样本计数器
     #endregion
 
@@ -284,6 +560,28 @@ def main():
             labels.append(label_buffer.cpu().numpy())
             all_lengths.append(seq_len)
             all_input_motions_vec.append(seq_feats.transpose(0, 1).cpu().numpy())
+
+            fix_out = fix_sequence_with_labels(
+                model=model,
+                diffusion=diffusion,
+                args=args,
+                motion_normalizer=motion_normalizer,
+                input_sequence=seq_feats,
+                length=seq_length,
+                device=device,
+                label_buffer=label_buffer,
+                cond_fn=cond_fn,
+                direction=args.fix_direction,
+            )
+            fixed_feats = fix_out["fixed_feats"]
+            fixed_motion_denorm = motion_normalizer.inverse(
+                fixed_feats.transpose(0, 1).cpu()
+            )
+            all_motions_fix.append(
+                globsmplrifkefeats_to_smpldata(fixed_motion_denorm[..., :-1])
+            )
+            all_fix_motions_vec.append(fixed_feats.transpose(0, 1).cpu().numpy())
+
             total_samples += 1
             print(f"已处理 {total_samples} 条序列（当前长度 {seq_len} 帧）")
 
@@ -294,28 +592,28 @@ def main():
                 print(f"序列 {total_samples} 的坏帧区间: {intervals}")
             #endregion
 
-            # TODO: 在得到整条序列的 label 之后再设计用这些标签去进行修复的逻辑。
-
             if args.num_samples and total_samples >= args.num_samples:
                 break
         if args.num_samples and total_samples >= args.num_samples:
             break
 
-    #region 保存结果
-    # os.makedirs(out_path, exist_ok=True)
-    # result_path = os.path.join(out_path, "results_long_smart.npy")
-    # print(f"saving detection results to [{result_path}]")
-    # np.save(
-    #     result_path,
-    #     {
-    #         "label": labels,
-    #         "gt_labels": gt_labels_buf,
-    #         "lengths": np.array(all_lengths, dtype=np.int32),
-    #         "all_input_motions_vec": all_input_motions_vec,
-    #     },
-    # )
-    # with open(result_path.replace(".npy", "_len.txt"), "w") as fw:
-    #     fw.write("\n".join(str(l) for l in all_lengths))
+    #region 保存结果（动作、修复、标签等）
+    os.makedirs(out_path, exist_ok=True)
+    result_path = os.path.join(out_path, "results_long_smart.npy")
+    print(f"saving results to [{result_path}]")
+    np.save(
+        result_path,
+        {
+            "motion_fix": all_motions_fix,
+            "label": labels,
+            "gt_labels": gt_labels_buf,
+            "lengths": np.array(all_lengths, dtype=np.int32),
+            "all_fix_motions_vec": all_fix_motions_vec,
+            "all_input_motions_vec": all_input_motions_vec,
+        },
+    )
+    with open(result_path.replace(".npy", "_len.txt"), "w", encoding="utf-8") as fw:
+        fw.write("\n".join(str(l) for l in all_lengths))
     #endregion
 
 
