@@ -37,38 +37,14 @@ def smart_args():
         "--target_window",
         type=int,
         default=100,
-        help="兼容旧参数：默认的 target 窗口大小，若未指定 detect/fix 单独值即使用该值。",
+        help="每个滑窗的 target 部分帧数，同时决定 stride (等于 target_window)。",
     )
     parser.add_argument(
         "--history_frames",
         dest="history_frames",
         type=int,
         default=20,
-        help="兼容旧参数：默认的 history/future 帧数，若未指定 detect/fix 单独值即使用该值。",
-    )
-    parser.add_argument(
-        "--detect_target_window",
-        type=int,
-        default=None,
-        help="检测分支独立的 target 窗口大小（覆盖 --target_window）。",
-    )
-    parser.add_argument(
-        "--detect_history_frames",
-        type=int,
-        default=None,
-        help="检测分支独立的 history/future 帧数（覆盖 --history_frames）。",
-    )
-    parser.add_argument(
-        "--fix_target_window",
-        type=int,
-        default=None,
-        help="修复分支独立的 target 窗口大小（覆盖 --target_window）。",
-    )
-    parser.add_argument(
-        "--fix_history_frames",
-        type=int,
-        default=None,
-        help="修复分支独立的 history/future 帧数（覆盖 --history_frames）。",
+        help="history 和 future 的帧数（对称），只作为上下文不会直接被标注。",
     )
     parser.add_argument(
         "--folder_path",
@@ -82,31 +58,18 @@ def smart_args():
         help="调试用：打印每条序列的坏帧闭区间。",
     )
     parser.add_argument(
-        "--no-reverse-pass-after-forward",
-        dest="reverse_pass_after_forward",
-        action="store_false",
-        help="跳过正向修复后的反向修复。",
+        "--fix_direction",
+        choices=["ltr", "rtl"],
+        default="ltr",
+        help="修复时窗口遍历方向。",
     )
-    parser.set_defaults(reverse_pass_after_forward=True)
     parser.add_argument(
         "--use_precomputed_cleanup",
         action="store_true",
         help="在 run_section 中复用 detection 结果作为进一步上下文（默认关闭）。",
     )
-    args = parse_and_load_from_model(parser)
-    args.detect_target_window = (
-        args.detect_target_window if args.detect_target_window is not None else args.target_window
-    )
-    args.detect_history_frames = (
-        args.detect_history_frames if args.detect_history_frames is not None else args.history_frames
-    )
-    args.fix_target_window = (
-        args.fix_target_window if args.fix_target_window is not None else args.target_window
-    )
-    args.fix_history_frames = (
-        args.fix_history_frames if args.fix_history_frames is not None else args.history_frames
-    )
-    return args
+    return parse_and_load_from_model(parser)
+
 
 
 def compute_target_starts(seq_len: int, target_size: int):
@@ -119,23 +82,6 @@ def compute_target_starts(seq_len: int, target_size: int):
     if not starts:
         starts = [0]
     return starts
-
-
-def compute_segment_starts(seq_len: int, segment_length: int, stride: int):
-    if seq_len <= 0:
-        return []
-    starts = []
-    cursor = 0
-    while cursor < seq_len:
-        starts.append(cursor)
-        cursor += stride
-    if starts:
-        last = starts[-1]
-        if last + segment_length < seq_len:
-            starts.append(max(seq_len - segment_length, 0))
-    else:
-        starts = [0]
-    return sorted(set(starts))
 
 def build_corrupt_intervals(mask):
     """
@@ -191,7 +137,6 @@ def detect_sequence_quality_labels(
     input_sequence,
     length,
     device,
-    cond_fn=None,
 ):
     """
     使用 history/target/future 窗口结构遍历整条序列，仅对 target 部分执行 detect_labels。
@@ -202,67 +147,80 @@ def detect_sequence_quality_labels(
     if seq_len == 0: return torch.zeros((0,), dtype=torch.bool, device=device)  # 空序列直接返回空标签
 
     seq_data = input_sequence[:, :seq_len]  # 丢弃 padding，只保留真实有效帧
-    target_size = args.detect_target_window  # target 区域的帧数（同时也是 stride）
-    history_frames = args.detect_history_frames  # history/future 各自的帧数
+    target_size = args.target_window  # target 区域的帧数（同时也是 stride）
+    history_frames = args.history_frames  # history/future 各自的帧数
     future_frames = history_frames  # 强制未来帧与 history 保持对称
     #endregion
 
-    #region 初始化：准备标签缓冲区和 segment 起点列表
-    label_buffer = torch.zeros((seq_len,), dtype=torch.bool, device=device)
-    segment_length = target_size
-    segment_stride = segment_length
-    segment_starts = compute_segment_starts(seq_len, segment_length, segment_stride)
+    #region 初始化：准备标签缓冲区和窗口起点列表
+    label_buffer = torch.zeros((seq_len,), dtype=torch.bool, device=device)  # 最终标签缓冲区
+    window_starts = compute_target_starts(seq_len, target_size)  # 计算 target 区域覆盖整条序列的起点列表
     #endregion
 
-    for seg_id, start in enumerate(segment_starts):
-        end = min(start + segment_length, seq_len)
-        if end <= start:
+    # 遍历每个 target 区域，逐帧执行 detect_labels
+    for start in window_starts:
+        target_end = min(seq_len, start + target_size)  # 计算 target 区域结束位置（不超过序列长度）
+        target_len = target_end - start
+        if target_len <= 0:  # target 区域为空，跳过
             continue
-        seg_len = end - start
-        seg_input = seq_data[:, start:end].unsqueeze(0)
-        length_tensor = torch.tensor([seg_len], device=device, dtype=length.dtype)
-        seg_mask = torch.ones((1, seg_len), dtype=torch.bool, device=device)
 
+        #region 计算可用的 history 和 future 长度：从当前 target 起点往前推 history 帧，往后推 future 帧
+        history_start = max(0, start - history_frames)  # history 起始位置（不超过 0）
+        history_len = start - history_start  # history 帧数（可能小于 history_frames）
+        future_end = min(seq_len, target_end + future_frames)  # future 结束位置（不超过序列长度）
+        future_len = future_end - target_end    # future 帧数（可能小于 future_frames）
+
+        window_frames = history_frames + target_size + future_frames  # 窗口总帧数（history + target + future）
+        window_input = torch.zeros((1, nfeats, window_frames), device=device)  # 输入张量：1 batch, nfeats 通道, window_frames 帧
+        window_attn = torch.zeros((1, window_frames), dtype=torch.bool, device=device)  # attention mask：全 False，表示所有帧都有效
+        #endregion
+
+        #region 设置attentionMask
+        # 将 history 对齐到 history 区间的右侧，attention_mask 只标记有效帧
+        if history_len > 0:
+            history_offset = history_frames - history_len
+            window_input[:, :, history_offset:history_frames] = seq_data[
+                :, history_start:start
+            ].unsqueeze(0)
+            window_attn[:, history_offset:history_frames] = True
+
+        # target 部分直接占据中间区域
+        target_offset = history_frames
+        window_input[:, :, target_offset : target_offset + target_len] = seq_data[
+            :, start:target_end
+        ].unsqueeze(0)
+        window_attn[:, target_offset : target_offset + target_len] = True
+
+        # future 也只填入实际帧数，超出部分留 False
+        future_offset = target_offset + target_len
+        if future_len > 0:
+            window_input[:, :, future_offset : future_offset + future_len] = seq_data[
+                :, target_end:future_end
+            ].unsqueeze(0)
+            window_attn[:, future_offset : future_offset + future_len] = True
+        #endregion
+
+        length_tensor = torch.tensor(
+            [history_len + target_len + future_len], device=device, dtype=length.dtype
+        )
+        #region 执行检测 直接将（history+target+future）作为输入，但是只取target的输出
         det_out = detect_labels(
             model=model,
             diffusion=diffusion,
             args=args,
-            input_motions=seg_input,
+            input_motions=window_input,
             length=length_tensor,
-            attention_mask=seg_mask,
+            attention_mask=window_attn,
             motion_normalizer=motion_normalizer,
         )
-        label = det_out["label"][:, :seg_len].to(device)
-        label_buffer[start:end] = label[0]
 
-        if args.debug_print_intervals:
-            flat_labels = label[0].cpu().numpy().astype(bool)
-            corrupt_intervals = format_intervals(
-                build_corrupt_intervals(flat_labels)
-            )
-            print(
-                f"检测 segment {seg_id}: start={start}, end={end}, len={seg_len}, "
-                f"corrupt_intervals={corrupt_intervals}"
-            )
+        label = det_out["label"][0].to(device)
+        label[:history_frames] = False
+        label[history_frames + target_len :] = False
 
-        fix_kwargs = dict(
-            model=model,
-            diffusion=diffusion,
-            args=args,
-            input_motions=seg_input,
-            length=length_tensor,
-            attention_mask=seg_mask,
-            motion_normalizer=motion_normalizer,
-            label=label,
-            re_sample_det_feats=det_out["re_sample_det_feats"],
-            cond_fn=cond_fn,
-        )
-        if args.use_precomputed_cleanup:
-            fix_kwargs.update(
-                label_for_cleanup=label,
-                re_sample_det_feats_for_cleanup=det_out["re_sample_det_feats"],
-            )
-        fix_motion(**fix_kwargs)
+        # 设置label_buffer只更新target部分的输出，无视history和future
+        label_buffer[start:target_end] = label[target_offset : target_offset + target_len]
+        #endregion
 
     return label_buffer
 
@@ -326,8 +284,8 @@ def fix_sequence_with_labels(
     # region 初始化
     seq_data = input_sequence[:, :seq_len] # 获取输入数据
     label_mask = label_buffer[:seq_len].to(device) # 获取标签
-    target_window = max(1, args.fix_target_window) # 确保 target_window 至少为 1
-    history_frames = args.fix_history_frames # 历史帧数
+    target_window = max(1, args.target_window) # 确保 target_window 至少为 1
+    history_frames = args.history_frames # 历史帧数
     future_frames = history_frames # 未来帧数
     intervals = build_corrupt_intervals_zero(label_mask.cpu().numpy()) # 构建坏帧区间列表
     if direction == "rtl":
@@ -461,7 +419,7 @@ def fix_sequence_with_labels(
         fix_feats = fix_result["sample_fix_feats"][0]
         #endregion
 
-        #region 更新修复输出，这里只更新了当前正在修复的损坏区间的部分
+        #region 更新修复输出
         interval_slice = slice(label_slice_start, label_slice_end)
         fixed_target_segment = fix_feats[:, interval_slice]
         target_relative_start = interval_start - target_start
@@ -469,7 +427,7 @@ def fix_sequence_with_labels(
         fixed_segment = fixed_target_segment[
             :, target_relative_start:target_relative_end
         ]
-        # 如果允许 连着上下文一起修复，则在累加器里累加当前段的修复结果
+        # 如果允许 granular aggregation，则在累加器里累加当前段的修复结果
         if use_aggregation:
             result_accum[:, interval_start:interval_end] += fixed_segment
             result_counts[interval_start:interval_end] += 1
@@ -502,59 +460,6 @@ def fix_sequence_with_labels(
     #endregion
 
     return {"fixed_feats": final_fix}
-
-
-@torch.no_grad()
-def detect_and_fix_sequence(
-    *,
-    model,
-    diffusion,
-    args,
-    motion_normalizer,
-    input_sequence,
-    length,
-    device,
-    cond_fn,
-    direction="ltr",
-    sequence_index=None,
-):
-    """
-    先跑一次 detect_sequence_quality_labels 再调用 fix_sequence_with_labels。
-    """
-
-    label_buffer = detect_sequence_quality_labels(
-        model=model,
-        diffusion=diffusion,
-        args=args,
-        motion_normalizer=motion_normalizer,
-        input_sequence=input_sequence,
-        length=length,
-        device=device,
-        cond_fn=cond_fn,
-    )
-
-    if args.debug_print_intervals:
-        flat_labels = label_buffer.cpu().numpy().astype(bool)
-        intervals = format_intervals(build_corrupt_intervals(flat_labels))
-        if sequence_index is None:
-            prefix = "当前"
-        else:
-            prefix = f"序列 {sequence_index}"
-        print(f"{prefix} 的坏帧区间: {intervals}")
-
-    fix_out = fix_sequence_with_labels(
-        model=model,
-        diffusion=diffusion,
-        args=args,
-        motion_normalizer=motion_normalizer,
-        input_sequence=input_sequence,
-        length=length,
-        device=device,
-        label_buffer=label_buffer,
-        cond_fn=cond_fn,
-        direction=direction,
-    )
-    return fix_out["fixed_feats"], label_buffer
 
 
 def main():
@@ -640,24 +545,8 @@ def main():
             seq_feats = input_motions[b, :, :seq_len]
             seq_length = torch.tensor([seq_len], device=device, dtype=length.dtype)
 
-            # #region 测试
-            # detect_and_fix_sequence(
-            #     model=model,
-            #     diffusion=diffusion,
-            #     args=args,
-            #     motion_normalizer=motion_normalizer,
-            #     input_sequence=seq_feats,
-            #     length=seq_length,
-            #     device=device,
-            #     cond_fn=cond_fn,
-            #     direction="ltr",
-            #     sequence_index=total_samples + 1,
-            # )
-            # return;
-            # #endregion
-
-            #region 正向修复
-            fixed_feats, forward_label_buffer = detect_and_fix_sequence(
+            #region 执行检测 直接将（history+target+future）作为输入，但是只取target的输出
+            label_buffer = detect_sequence_quality_labels(
                 model=model,
                 diffusion=diffusion,
                 args=args,
@@ -665,37 +554,26 @@ def main():
                 input_sequence=seq_feats,
                 length=seq_length,
                 device=device,
-                cond_fn=cond_fn,
-                direction="ltr",
-                sequence_index=total_samples + 1,
             )
             #endregion
 
-            combined_label_buffer = forward_label_buffer.clone()
-
-            #region 如果开启反向修复，则再跑一次反向修复
-            if args.reverse_pass_after_forward:
-                print(f"执行反向修复")
-                fixed_feats, reverse_label_buffer = detect_and_fix_sequence(
-                    model=model,
-                    diffusion=diffusion,
-                    args=args,
-                    motion_normalizer=motion_normalizer,
-                    input_sequence=fixed_feats,
-                    length=seq_length,
-                    device=device,
-                    cond_fn=cond_fn,
-                    direction="rtl",
-                    sequence_index=total_samples + 1,
-                )
-                combined_label_buffer |= reverse_label_buffer
-            #endregion
-
-            #region 最终数据记录（反向修复后替代正向结果）
-            labels.append(combined_label_buffer.cpu().numpy())
+            labels.append(label_buffer.cpu().numpy())
             all_lengths.append(seq_len)
             all_input_motions_vec.append(seq_feats.transpose(0, 1).cpu().numpy())
 
+            fix_out = fix_sequence_with_labels(
+                model=model,
+                diffusion=diffusion,
+                args=args,
+                motion_normalizer=motion_normalizer,
+                input_sequence=seq_feats,
+                length=seq_length,
+                device=device,
+                label_buffer=label_buffer,
+                cond_fn=cond_fn,
+                direction=args.fix_direction,
+            )
+            fixed_feats = fix_out["fixed_feats"]
             fixed_motion_denorm = motion_normalizer.inverse(
                 fixed_feats.transpose(0, 1).cpu()
             )
@@ -703,10 +581,16 @@ def main():
                 globsmplrifkefeats_to_smpldata(fixed_motion_denorm[..., :-1])
             )
             all_fix_motions_vec.append(fixed_feats.transpose(0, 1).cpu().numpy())
-            #endregion
 
             total_samples += 1
-            print(f"已处理 {total_samples} 条序列（当前长度 {seq_len} 帧）\n")
+            print(f"已处理 {total_samples} 条序列（当前长度 {seq_len} 帧）")
+
+            #region 打印坏帧区间
+            if args.debug_print_intervals:
+                flat_labels = label_buffer.cpu().numpy().astype(bool)
+                intervals = format_intervals(build_corrupt_intervals(flat_labels))
+                print(f"序列 {total_samples} 的坏帧区间: {intervals}")
+            #endregion
 
             if args.num_samples and total_samples >= args.num_samples:
                 break
