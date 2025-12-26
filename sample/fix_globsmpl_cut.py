@@ -52,7 +52,33 @@ def cut_args():
         action="store_true",
         help="是否将在检测分支输出的 label/re_sample 特征传给 ensemble clean-up 逻辑。",
     )
+    parser.add_argument(
+        "--debug_print_intervals",
+        action="store_true",
+        help="调试用：打印每个 segment 的坏帧区间。",
+    )
     return parse_and_load_from_model(parser)
+
+
+def build_corrupt_intervals_zero(mask):
+    intervals = []
+    start = None
+    for idx, flag in enumerate(mask):
+        if flag:
+            if start is None:
+                start = idx
+        elif start is not None:
+            intervals.append((start, idx))
+            start = None
+    if start is not None:
+        intervals.append((start, len(mask)))
+    return intervals
+
+
+def format_intervals(intervals):
+    if not intervals:
+        return "[]"
+    return "[" + ",".join(f"[{s},{e}]" for s, e in intervals) + "]"
 
 
 def compute_segment_starts(seq_len: int, segment_length: int, stride: int):
@@ -208,6 +234,14 @@ def main():
                     motion_normalizer=motion_normalizer,
                 )
                 label = det_out["label"].to(device)
+                if args.debug_print_intervals:
+                    flat_labels = label[0, :seg_len].cpu().numpy().astype(bool)
+                    intervals = build_corrupt_intervals_zero(flat_labels)
+                    print(
+                        f"sample {total_samples} segment {seg_id} bad intervals: "
+                        f"{format_intervals(intervals)}"
+                    )
+
                 fix_kwargs = dict(
                     model=model,
                     diffusion=diffusion,
