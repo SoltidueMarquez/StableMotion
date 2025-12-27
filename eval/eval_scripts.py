@@ -75,15 +75,27 @@ if __name__ == '__main__':
     # --------------------
     # Optional quality indicator prediction metrics (if present in predictions)
     # --------------------
-    pred_labels, gt_lables = [], []
+    def _normalize_label_list(raw_list):
+        out = []
+        for item in raw_list:
+            arr = np.array(item)
+            if arr.ndim == 1:
+                out.append(arr)
+            elif arr.ndim == 2:
+                for row in arr:
+                    out.append(np.array(row))
+            else:
+                raise ValueError(f"Unsupported label shape {arr.shape}")
+        return out
+
     if 'gt_labels' in datas.keys():
         assert len(datas['gt_labels']) == len(datas['label'])
-        for i in range(len(datas['gt_labels'])):
-            pred_labels += datas['label'][i].tolist()
-            gt_lables += datas['gt_labels'][i].tolist()
+        pred_labels = _normalize_label_list(datas["label"])
+        gt_labels = _normalize_label_list(datas["gt_labels"])
+        assert len(pred_labels) == len(gt_labels) == len(lengths), "label 与 lengths 数量不一致"
         acc, precision, recall, f1 = compute_label_metrics(
-            preds=np.array(pred_labels),
-            gts=np.array(gt_lables),
+            preds=pred_labels,
+            gts=gt_labels,
             lengths=lengths,
         )
         print(f"Label prediction: Accuracy: {acc:.5f}; Precision: {precision:.5f}, Recall: {recall:.5f}, f1-score: {f1:.5f}")

@@ -376,6 +376,7 @@ def detect_sequence_quality_labels_segment(
         #         re_sample_det_feats_for_cleanup=det_out["re_sample_det_feats"],
         #     )
         fix_motion(**fix_kwargs)
+        # debug print label_buffer
 
     return label_buffer
 
