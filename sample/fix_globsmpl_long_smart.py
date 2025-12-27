@@ -316,6 +316,8 @@ def detect_sequence_quality_labels_segment(
     nfeats = input_sequence.shape[0]  # 每帧通道数（包含标签）
     if seq_len == 0: return torch.zeros((0,), dtype=torch.bool, device=device)  # 空序列直接返回空标签
 
+    # print(f"[DEBUG] detect_sequence_quality_labels_segment: 模型的训练态={model.training}")
+
     seq_data = input_sequence[:, :seq_len]  # 丢弃 padding，只保留真实有效帧
     target_size = args.detect_target_window + args.detect_history_frames*2  # target+history+future 区域的帧数（同时也是 stride）
     #endregion
@@ -357,7 +359,9 @@ def detect_sequence_quality_labels_segment(
                 f"检测 segment {seg_id}: start={start}, end={end}, len={seg_len}, "
                 f"corrupt_intervals={corrupt_intervals}"
             )
-
+        
+        # print(f"[DEBUG] seg {seg_id}: 模型的训练态(before fix)={model.training}")
+        # print("修复前"+str(label_buffer))
         fix_kwargs = dict(
             model=model,
             diffusion=diffusion,
@@ -376,7 +380,8 @@ def detect_sequence_quality_labels_segment(
         #         re_sample_det_feats_for_cleanup=det_out["re_sample_det_feats"],
         #     )
         fix_motion(**fix_kwargs)
-        # debug print label_buffer
+        # print("修复后"+str(label_buffer))
+        # print(f"[DEBUG] seg {seg_id}: 模型的训练态(after fix)={model.training}")
 
     return label_buffer
 
@@ -721,6 +726,12 @@ def main():
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
+    # 显式将外层/内层模型都切到 eval，避免 BN/Dropout 留在 train 态
+    # model.train(False)
+    # if hasattr(model, "ema_model"):
+    #     model.ema_model.eval()
+    #     model.ema_model.train(False)
+    # print(f"[DEBUG]模型的训练态(init)={model.training}, ema={getattr(model, 'ema_model', None) and model.ema_model.training}")
     #endregion
 
     #region 准备条件函数，用于分类器引导
