@@ -34,19 +34,6 @@ def smart_args():
     add_base_options(parser)
     add_sampling_options(parser)
     parser.add_argument(
-        "--target_window",
-        type=int,
-        default=100,
-        help="兼容旧参数：默认的 target 窗口大小，若未指定 detect/fix 单独值即使用该值。",
-    )
-    parser.add_argument(
-        "--history_frames",
-        dest="history_frames",
-        type=int,
-        default=20,
-        help="兼容旧参数：默认的 history/future 帧数，若未指定 detect/fix 单独值即使用该值。",
-    )
-    parser.add_argument(
         "--detect_target_window",
         type=int,
         default=None,
@@ -99,19 +86,12 @@ def smart_args():
         action="store_true",
         help="在 run_section 中复用 detection 结果作为进一步上下文（默认关闭）。",
     )
+    parser.add_argument(
+        "--debug_compare_detect_inputs",
+        action="store_true",
+        help="同时运行 window/segment 检测并对比传入 detect_labels 的输入是否一致。",
+    )
     args = parse_and_load_from_model(parser)
-    args.detect_target_window = (
-        args.detect_target_window if args.detect_target_window is not None else args.target_window
-    )
-    args.detect_history_frames = (
-        args.detect_history_frames if args.detect_history_frames is not None else args.history_frames
-    )
-    args.fix_target_window = (
-        args.fix_target_window if args.fix_target_window is not None else args.target_window
-    )
-    args.fix_history_frames = (
-        args.fix_history_frames if args.fix_history_frames is not None else args.history_frames
-    )
     return args
 
 
@@ -198,6 +178,7 @@ def detect_sequence_quality_labels_window(
     length,
     device,
     cond_fn=None,
+    debug_collect=None,
 ):
     """
     使用 history/target/future 窗口结构遍历整条序列，仅对 target 部分执行 detect_labels。
@@ -208,14 +189,19 @@ def detect_sequence_quality_labels_window(
     if seq_len == 0: return torch.zeros((0,), dtype=torch.bool, device=device)  # 空序列直接返回空标签
 
     seq_data = input_sequence[:, :seq_len]  # 丢弃 padding，只保留真实有效帧
-    target_size = args.target_window  # target 区域的帧数（同时也是 stride）
-    history_frames = args.history_frames  # history/future 各自的帧数
+    target_size = args.detect_target_window  # target 区域的帧数（同时也是 stride）
+    history_frames = args.detect_history_frames  # history/future 各自的帧数
     future_frames = history_frames  # 强制未来帧与 history 保持对称
+    if args.debug_print_intervals:
+        print(f"[DEBUG] 目标窗口={target_size}, 历史窗口={history_frames}, 未来窗口={future_frames}")
     #endregion
 
     #region 初始化：准备标签缓冲区和窗口起点列表
     label_buffer = torch.zeros((seq_len,), dtype=torch.bool, device=device)  # 最终标签缓冲区
     window_starts = compute_target_starts(seq_len, target_size)  # 计算 target 区域覆盖整条序列的起点列表
+    if args.debug_print_intervals:
+        print(f"[DEBUG] 目标起点列表: {window_starts}")
+
     #endregion
 
     # 遍历每个 target 区域，逐帧执行 detect_labels
@@ -229,45 +215,44 @@ def detect_sequence_quality_labels_window(
         history_start = max(0, start - history_frames)  # history 起始位置（不超过 0）
         history_len = start - history_start  # history 帧数（可能小于 history_frames）
         missing_history = max(0, history_frames - history_len)
+
         future_end = min(seq_len, target_end + future_frames + missing_history)  # future 结束位置（不超过序列长度）
         future_len = future_end - target_end    # future 帧数（可能小于 future_frames + missing_history）
+        if args.debug_print_intervals:
+            print(f"[DEBUG] history_start={history_start}, history_len={history_len}, future_end={future_end}, future_len={future_len}")
 
-        # history缺失的部分需要用future填补
-        window_future = future_frames + missing_history
-        window_frames = history_frames + target_size + window_future  # 窗口总帧数（history + target + future）
+        # history缺失的部分需要用future填补，但窗口长度按实际 history/target/future 相加
+        window_frames = history_len + target_len + future_len  # 窗口总帧数（history + target + future）
         window_input = torch.zeros((1, nfeats, window_frames), device=device)  # 输入张量：1 batch, nfeats 通道, window_frames 帧
         window_attn = torch.zeros((1, window_frames), dtype=torch.bool, device=device)  # attention mask：全 False，表示所有帧都有效
         #endregion
 
-        #region 设置attentionMask
-        # 将 history 对齐到 history 区间的右侧，attention_mask 只标记有效帧
-        if history_len > 0:
-            history_offset = history_frames - history_len
-            window_input[:, :, history_offset:history_frames] = seq_data[
-                :, history_start:start
-            ].unsqueeze(0)
-            window_attn[:, history_offset:history_frames] = True
-
-        # target 部分直接占据中间区域
-        target_offset = history_frames
-        window_input[:, :, target_offset : target_offset + target_len] = seq_data[
-            :, start:target_end
-        ].unsqueeze(0)
-        window_attn[:, target_offset : target_offset + target_len] = True
-
-        # future 也只填入实际帧数，超出部分留 False
-        future_offset = target_offset + target_len
-        if future_len > 0:
-            window_input[:, :, future_offset : future_offset + future_len] = seq_data[
-                :, target_end:future_end
-            ].unsqueeze(0)
-            window_attn[:, future_offset : future_offset + future_len] = True
+        #region 设置attentionMask（直接切片，不再逐段填充）
+        target_offset = history_len  # target 起点相对于窗口
+        window_input[:, :, :window_frames] = seq_data[:, history_start:future_end].unsqueeze(0)
+        window_attn[:, :window_frames] = True
         #endregion
 
         length_tensor = torch.tensor(
             [history_len + target_len + future_len], device=device, dtype=length.dtype
         )
         #region 执行检测 直接将（history+target+future）作为输入，但是只取target的输出
+        if debug_collect is not None:
+            debug_collect.append(
+                {
+                    "src": "window",
+                    "start": start,
+                    "end": target_end,
+                    "target_offset": target_offset,
+                    "target_len": target_len,
+                    "input_motions": window_input.detach().cpu(),
+                    "attention_mask": window_attn.detach().cpu(),
+                    "length": length_tensor.detach().cpu(),
+                }
+            )
+        if args.debug_print_intervals:
+            print(f"[DEBUG] input_motions={window_input.shape}, length={length_tensor}")
+
         det_out = detect_labels(
             model=model,
             diffusion=diffusion,
@@ -277,13 +262,35 @@ def detect_sequence_quality_labels_window(
             attention_mask=window_attn,
             motion_normalizer=motion_normalizer,
         )
+        if debug_collect is not None:
+            debug_collect[-1]["motion_normalizer_shape"] = getattr(motion_normalizer, "mean", None) is not None and getattr(motion_normalizer, "mean").shape or None
+            debug_collect[-1]["motion_normalizer_id"] = id(motion_normalizer)
+            debug_collect[-1]["det_label"] = det_out["label"].detach().cpu()
+            debug_collect[-1]["det_feats"] = det_out["re_sample_det_feats"].detach().cpu()
+
+        # fix_kwargs = dict(
+        #     model=model,
+        #     diffusion=diffusion,
+        #     args=args,
+        #     input_motions=window_input,
+        #     length=length_tensor,
+        #     attention_mask=window_attn,
+        #     motion_normalizer=motion_normalizer,
+        #     label=det_out["label"].clone(),
+        #     re_sample_det_feats=det_out["re_sample_det_feats"].clone(),
+        #     cond_fn=cond_fn,
+        # )
+        # fix_motion(**fix_kwargs)
 
         label = det_out["label"][0].to(device)
 
         # 设置label_buffer只更新target部分的输出，无视history和future
+        if args.debug_print_intervals:
+            print(f"[DEBUG] target 结果覆盖: start={start}, end={target_end}, target_offset={target_offset}, target_len={target_len}")
+
         target_label_slice = label[target_offset : target_offset + target_len]
         label_buffer[start:target_end] = target_label_slice
-
+        
         if args.debug_print_intervals:
             corrupt_intervals = format_intervals(
                 build_corrupt_intervals(target_label_slice.cpu().numpy().astype(bool))
@@ -307,6 +314,7 @@ def detect_sequence_quality_labels_segment(
     length,
     device,
     cond_fn=None,
+    debug_collect=None,
 ):
     """
     直接切分整条序列，执行 detect_labels。
@@ -338,6 +346,17 @@ def detect_sequence_quality_labels_segment(
         length_tensor = torch.tensor([seg_len], device=device, dtype=length.dtype)
         seg_mask = torch.ones((1, seg_len), dtype=torch.bool, device=device)
 
+        if debug_collect is not None:
+            debug_collect.append(
+                {
+                    "src": "segment",
+                    "start": start,
+                    "end": end,
+                    "input_motions": seg_input.detach().cpu(),
+                    "attention_mask": seg_mask.detach().cpu(),
+                    "length": length_tensor.detach().cpu(),
+                }
+            )
         det_out = detect_labels(
             model=model,
             diffusion=diffusion,
@@ -347,6 +366,12 @@ def detect_sequence_quality_labels_segment(
             attention_mask=seg_mask,
             motion_normalizer=motion_normalizer,
         )
+        if debug_collect is not None:
+            debug_collect[-1]["motion_normalizer_shape"] = getattr(motion_normalizer, "mean", None) is not None and getattr(motion_normalizer, "mean").shape or None
+            debug_collect[-1]["motion_normalizer_id"] = id(motion_normalizer)
+            debug_collect[-1]["det_label"] = det_out["label"].detach().cpu()
+            debug_collect[-1]["det_feats"] = det_out["re_sample_det_feats"].detach().cpu()
+
         label = det_out["label"][:, :seg_len].to(device)
         label_buffer[start:end] = label[0]
 
@@ -374,16 +399,120 @@ def detect_sequence_quality_labels_segment(
             re_sample_det_feats=det_out["re_sample_det_feats"],
             cond_fn=cond_fn,
         )
-        # if args.use_precomputed_cleanup:
-        #     fix_kwargs.update(
-        #         label_for_cleanup=label,
-        #         re_sample_det_feats_for_cleanup=det_out["re_sample_det_feats"],
-        #     )
         fix_motion(**fix_kwargs)
         # print("修复后"+str(label_buffer))
         # print(f"[DEBUG] seg {seg_id}: 模型的训练态(after fix)={model.training}")
 
     return label_buffer
+
+
+def compare_detect_inputs(
+    *,
+    model,
+    diffusion,
+    args,
+    motion_normalizer,
+    input_sequence,
+    length,
+    device,
+    cond_fn,
+):
+    win_collect: list[dict] = []
+    seg_collect: list[dict] = []
+
+    win_labels = detect_sequence_quality_labels_window(
+        model=model,
+        diffusion=diffusion,
+        args=args,
+        motion_normalizer=motion_normalizer,
+        input_sequence=input_sequence,
+        length=length,
+        device=device,
+        cond_fn=cond_fn,
+        debug_collect=win_collect,
+    )
+    seg_labels = detect_sequence_quality_labels_segment(
+        model=model,
+        diffusion=diffusion,
+        args=args,
+        motion_normalizer=motion_normalizer,
+        input_sequence=input_sequence,
+        length=length,
+        device=device,
+        cond_fn=cond_fn,
+        debug_collect=seg_collect,
+    )
+
+    # if len(win_collect) != len(seg_collect):
+    #     print(f"[DEBUG][COMPARE] 调用次数不一致: window={len(win_collect)}, segment={len(seg_collect)}")
+    #     return win_labels
+
+    for idx, (w, s) in enumerate(zip(win_collect, seg_collect)):
+        # 输入对比
+        same_shape_in = (
+            w["input_motions"].shape == s["input_motions"].shape
+            and w["attention_mask"].shape == s["attention_mask"].shape
+            and w["length"].shape == s["length"].shape
+            and w["motion_normalizer_shape"] == s["motion_normalizer_shape"]
+        )
+        same_val_in = (
+            same_shape_in
+            and torch.allclose(w["input_motions"], s["input_motions"])
+            and torch.equal(w["attention_mask"], s["attention_mask"])
+            and torch.equal(w["length"], s["length"])
+            and w["motion_normalizer_id"] == s["motion_normalizer_id"]
+        )
+
+        # 输出对比
+        same_shape_out = (
+            w["det_label"].shape == s["det_label"].shape
+            and w["det_feats"].shape == s["det_feats"].shape
+        )
+        same_val_out = (
+            same_shape_out
+            and torch.equal(w["det_label"], s["det_label"])
+            # and torch.allclose(w["det_feats"], s["det_feats"])
+        )
+
+        if not same_val_in:
+            print(
+                f"[DEBUG][COMPARE][INPUT] 第 {idx} 次输入不一致: "
+                f"window(start={w.get('start')},end={w.get('end')}) "
+                f"vs segment(start={s.get('start')},end={s.get('end')})"
+            )
+            print(f"[DEBUG][COMPARE][INPUT] window shape: {w['input_motions'].shape}, segment shape: {s['input_motions'].shape}")
+        else:
+            print(
+                f"[DEBUG][COMPARE][INPUT] 第 {idx} 次输入一致: "
+                f"window(start={w.get('start')},end={w.get('end')}) "
+                f"vs segment(start={s.get('start')},end={s.get('end')})"
+            )
+
+        if not same_val_out:
+            print(
+                f"[DEBUG][COMPARE][OUTPUT] 第 {idx} 次输出不一致: "
+                f"window(start={w.get('start')},end={w.get('end')}) "
+                f"vs segment(start={s.get('start')},end={s.get('end')})"
+            )
+            print(f"[DEBUG][COMPARE][OUTPUT] label shape: win {w['det_label'].shape}, seg {s['det_label'].shape}")
+            print(f"[DEBUG][COMPARE][OUTPUT] feats shape: win {w['det_feats'].shape}, seg {s['det_feats'].shape}")
+            win_mask = w["det_label"].cpu().numpy().astype(bool).reshape(-1)
+            seg_mask = s["det_label"].cpu().numpy().astype(bool).reshape(-1)
+            win_intervals = format_intervals(build_corrupt_intervals(win_mask))
+            seg_intervals = format_intervals(build_corrupt_intervals(seg_mask))
+            print(f"[DEBUG][COMPARE][OUTPUT] win label intervals: {win_intervals}")
+            print(f"[DEBUG][COMPARE][OUTPUT] seg label intervals: {seg_intervals}")
+        else:
+            print(
+                f"[DEBUG][COMPARE][OUTPUT] 第 {idx} 次输出一致: "
+                f"window(start={w.get('start')},end={w.get('end')}) "
+                f"vs segment(start={s.get('start')},end={s.get('end')})"
+            )
+            win_mask = w["det_label"].cpu().numpy().astype(bool).reshape(-1)
+            win_intervals = format_intervals(build_corrupt_intervals(win_mask))
+            print(f"[DEBUG][COMPARE][OUTPUT] win/seg label intervals: {win_intervals}")
+
+    return win_labels
 
 
 def gather_context(
@@ -775,6 +904,19 @@ def main():
 
             seq_feats = input_motions[b, :, :seq_len]
             seq_length = torch.tensor([seq_len], device=device, dtype=length.dtype)
+
+            if args.debug_compare_detect_inputs:
+                labels_cmp = compare_detect_inputs(
+                    model=model,
+                    diffusion=diffusion,
+                    args=args,
+                    motion_normalizer=motion_normalizer,
+                    input_sequence=seq_feats,
+                    length=length,
+                    device=device,
+                    cond_fn=cond_fn,
+                )
+                return seq_feats, labels_cmp
 
             #region 正向修复
             fixed_feats, forward_label_buffer = detect_and_fix_sequence(

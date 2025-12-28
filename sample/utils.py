@@ -272,6 +272,7 @@ def run_cleanup_selection(
     score /= eval_times                                                             # 求均值，平滑噪声
     score = torch.sum((score > 0.0) * rp_model_kwargs_detmode['attention_mask'], dim=-1)  # 对有效帧求和得分
     score = einops.rearrange(score, "(repeat b) -> repeat b", repeat=forward_rp_times)     # 还原为 [forward_rp_times, bs]
+    # 没算loss怎么会改变model呢
 
     sample_candidates = einops.rearrange(sample, "(repeat b) c l -> repeat b c l", repeat=forward_rp_times)  # 重排候选 [repeat, bs, C, L]
     selected_id = torch.argmin(score, dim=0)                                       # [bs] 选择分数最低的候选
