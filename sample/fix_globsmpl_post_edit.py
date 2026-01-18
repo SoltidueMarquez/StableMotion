@@ -28,41 +28,31 @@ def fix_motion(
     length,                  # Tensor[int] shape [B]，每条序列的有效帧长度
     attention_mask,          # [B, N] bool，标记有效帧区域
     motion_normalizer,       # 用于特征归一化/反归一化的工具
-    label,                   # [B, N] bool，检测阶段得到的坏帧标记
-    re_sample_det_feats,     # [B, C, N] 检测阶段的采样特征，用于软修复调度
     cond_fn=None,            # 可选 classifier guidance 函数
 ):
     device = input_motions.device
     bs, nfeats, nframes = input_motions.shape
 
-
     # TODO: 修改为post edit的修复思路
-    # sample_fix = run_cleanup_selection(
-    #     model=model,
-    #     model_kwargs_detmode={
-    #         "y": {
-    #             # 只重绘标签通道，其余保持原输入
-    #             "inpainting_mask": torch.ones_like(input_motions).bool().index_fill_(1, torch.tensor([nfeats-1], device=device), False),
-    #             # 标签通道写 1.0 作为待预测占位
-    #             "inpainted_motion": input_motions.clone().index_fill_(1, torch.tensor([nfeats-1], device=device), 1.0),
-    #         },
-    #         # 标签通道需要预测且在有效帧内
-    #         "inpaint_cond": ((~torch.ones_like(input_motions).bool().index_fill_(1, torch.tensor([nfeats-1], device=device), False))& attention_mask.unsqueeze(-2)),
-    #         "length": length,                   # 有效帧长度
-    #         "attention_mask": attention_mask,   # 注意力掩码
+
+    # TODO: 这边需要先构造model_kwargs，这里是全局加噪的
+    # model_kwargs_fix = {
+    #     "y": {
+    #         "inpainting_mask": inpainting_mask_fixmode.clone(),  # 告知哪些位置保持、哪些重绘
+    #         "inpainted_motion": inpaint_motion_fixmode.clone(),  # 修复的起始内容
     #     },
-    #     model_kwargs=model_kwargs_fix,          # 修复模式的条件
-    #     motion_normalizer=motion_normalizer,    # 反归一化工具
-    #     args=args,
-    #     bs=bs,
-    #     nfeats=nfeats,
-    #     nframes=nframes,
-    #     sample_fn=sample_fn,
-    #     cond_fn=cond_fn if args.classifier_scale else None,  # 可选 classifier 指引
-    #     precomputed_label=label_for_cleanup,
-    #     precomputed_re_sample=re_sample_det_feats_for_cleanup,
-    # )
-    
+    #     "inpaint_cond": inpaint_cond_fixmode.clone(),            # 需要预测的位置掩码
+    #     "length": length,                                       # 每个样本的有效长度
+    #     "attention_mask": attention_mask,                       # 帧级注意力掩码
+    # }    
+
+    # 获取带噪声的潜变量起点
+    motions_t = null_inversion.get_start(input_motions, starting_timestep=starting_timestep)
+    # 执行带有郎之万优化和注意力控制的采样
+    # TODO：这里的Operator是InpaintingOperator，需要调用 set_mask 与 get_detection_mask 来设置和获取当前的mask
+    samples = null_inversion.sample_in_batch(motions_t, operator, y, starting_timestep=starting_timestep)
+  
+    sample_fix = samples[1].unsqueeze(0)
 
     # 解码：将特征反归一化并拆出身体动作部分
     sample_fix_det = motion_normalizer.inverse(sample_fix.transpose(1, 2).cpu())  # 反归一化到物理尺度
@@ -141,19 +131,16 @@ def main():
 
         all_input_motions_vec.append(input_motions.transpose(1, 2).cpu().numpy())  # 记录原始特征
 
-        # TODO:这边要修改成postEdit的修复流程
-        # fix_out = fix_motion(                                      # 运行修复分支
-        #     model=model,                                           # 同一扩散模型
-        #     diffusion=diffusion,                                   # 扩散调度器
-        #     args=args,                                             # 运行配置
-        #     input_motions=input_motions,                           # 原始输入特征
-        #     length=length,                                         # 每样本长度
-        #     attention_mask=attention_mask,                         # 有效帧掩码
-        #     motion_normalizer=motion_normalizer,                   # 归一化/反归一化工具
-        #     label=label,                                           # 检测或 GT 的坏帧标签
-        #     re_sample_det_feats=re_sample_det_feats,               # 检测阶段的采样特征，供软修复等使用
-        #     cond_fn=cond_fn,                                       # 可选 classifier guidance
-        # )
+        fix_out = fix_motion(                                      # 运行修复分支
+            model=model,                                           # 同一扩散模型
+            diffusion=diffusion,                                   # 扩散调度器
+            args=args,                                             # 运行配置
+            input_motions=input_motions,                           # 原始输入特征
+            length=length,                                         # 每样本长度
+            attention_mask=attention_mask,                         # 有效帧掩码
+            motion_normalizer=motion_normalizer,                   # 归一化/反归一化工具
+            cond_fn=cond_fn,                                       # 可选 classifier guidance
+        )
         sample_fix_feats = fix_out["sample_fix_feats"]             # 修复后的特征
         fixed_motion = fix_out["fixed_motion"]                     # 修复后解码的动作
 
@@ -175,7 +162,7 @@ def main():
         {
             "motion": all_motions,                 # 检测阶段解码的动作
             "motion_fix": all_motions_fix,         # 修复阶段解码的动作
-            "label": labels,                       # 预测标签（坏帧掩码）
+            "label": labels,                       # 预测标签（坏帧掩码）# TODO:需要补一下
             "gt_labels": gt_labels_buf,            # GT 标签
             "lengths": all_lengths,                # 每样本长度
             "all_fix_motions_vec": all_fix_motions_vec,   # 修复后的特征序列

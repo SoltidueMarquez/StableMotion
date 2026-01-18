@@ -156,3 +156,119 @@ class LangevinDynamics(nn.Module):
         multiplier = (1 ** (1 / p) + ratio * (self.lr_min_ratio ** (1 / p) - 1 ** (1 / p))) ** p
         return multiplier * self.lr
 # endregion
+
+# region 空反向传播类（Null Inversion）：负责动作序列的加噪与反向优化采样。
+class NullInversion: 
+    def __init__(
+        self, 
+        diffusion,   # 这里对应 StableMotion 的 SpacedDiffusion 对象
+        model,       # 这里对应 StableMotion 的模型主体
+        lgvd_config
+    ):
+        self.diffusion = diffusion
+        self.model = model
+        self.lgvd = LangevinDynamics(**lgvd_config)
+
+    def get_start(self, ref, starting_timestep=999,noise=None):
+        """
+        根据输入动作序列 ref 添加指定步数的噪声。
+        ref: [B, C, N]
+        starting_timestep: 起始时间步 (通常是 0 到 T-1 之间的整数)
+        """
+        device = ref.device
+        # 1. 确保 timestep 是张量且在正确设备上
+        t = torch.tensor([starting_timestep] * ref.shape[0], device=device).long()
+        # 2. 如果没有提供噪声，则生成随机噪声
+        if noise is None:
+            noise = torch.randn_like(ref)
+        # 3. 调用 StableMotion 的 q_sample 进行前向加噪
+        x_start = self.diffusion.q_sample(ref, t, noise=noise)
+        
+        return x_start
+    
+    def prev_step(
+        self, 
+        timestep, 
+        sample, 
+        operator, 
+        measurement, 
+        orginal_input_motions,
+        model_kwargs,
+        annel_interval=100, 
+        w = 0.25
+    ):
+        """
+        在采样循环中执行反向步处理，并结合郎之万动力学（Langevin Dynamics）进行迭代优化。
+        这是 PostEdit 的核心，用于在去噪过程中强制让生成结果符合测量值（y）。
+        """
+        # 1. 计算总的迭代步数
+        num_steps = int((timestep - 1) / annel_interval)
+        
+        # 使用进度条显示扩散步的进度
+        step_pbar = tqdm(range(num_steps), desc="    Diffusion Steps", leave=False)
+        for step in step_pbar:
+            # 2. 预测去噪后的原始动作估计 (x0)
+            # 通过当前的采样状态 sample 预测出对应的干净动作估计 pred_original_sample
+            pred_original_sample = self.sampler_one_step(timestep, sample, model_kwargs)
+            
+            # 3. 郎之万动力学优化
+            # 调用 LGVD 模块，对预测出的 x0 进行优化。
+            # 使其既接近模型预测的结果，又能够通过 operator 满足测量值 measurement。
+            # 这里的噪声水平 sigma 直接从 diffusion 对象的预计算系数中获取
+            sigma = self.diffusion.sqrt_one_minus_alphas_cumprod[timestep]
+            pred_x0 = self.lgvd.sample(pred_original_sample, operator, measurement, sigma, step / num_steps, verbose=True)
+            
+            # 4. 时间步递减
+            timestep = timestep - annel_interval
+            
+            # 5. 混合与重新加噪
+            # 将优化后的结果与原始动作序列 (orginal_input_motions) 按比例 w 进行混合，以增强保真度。
+            # 然后调用 get_start 重新加上噪声，得到下一个时间步的采样状态 sample。
+            sample = self.get_start((1 - w) * pred_x0 + w * orginal_input_motions, timestep)
+            
+        return pred_original_sample
+
+    def sampler_one_step(
+        self, 
+        timestep, 
+        sample, 
+        model_kwargs
+    ):
+        """
+        单步采样：从 x_t 预测 x_0。
+        适配 StableMotion (OpenAI Diffusion) 架构。
+        """
+        device = sample.device
+        # 1. 准备时间步张量
+        t = torch.tensor([timestep] * sample.shape[0], device=device).long()
+        
+        # 2. 预测噪声
+        # 注意：在 StableMotion 中，model 会根据 model_kwargs 处理 inpainting 等条件
+        # ...
+        with torch.no_grad():
+            # 检查是否有时间步缩放逻辑
+            t_input = t
+            if hasattr(self.diffusion, "_scale_timesteps"):
+                t_input = self.diffusion._scale_timesteps(t)
+            
+            model_output = self.model(sample, t_input, **model_kwargs)
+            
+        # 3. 解析模型输出
+        # 如果模型输出包含方差信息（如 Learned Sigma），则需要截取前一半作为噪声预测
+        # 在 StableMotion 中，通常 C 维度是 [2*original_C]，后半段是方差预测
+        if model_output.shape[1] == sample.shape[1] * 2:
+            eps, _ = torch.split(model_output, sample.shape[1], dim=1)
+        else:
+            eps = model_output
+            
+        # 4. 根据公式从 eps 预测 x_0
+        # x_0 = (1/sqrt(alpha_cumprod)) * x_t - (sqrt(1/alpha_cumprod - 1)) * eps
+        pred_x0 = self.diffusion._predict_xstart_from_eps(x_t=sample, t=t, eps=eps)
+
+        return pred_x0
+    
+    def sample_in_batch(self, x_start, operator, y, orginal_input_motions, model_kwargs, starting_timestep=999):
+        """批量执行反向步"""
+        samples = self.prev_step(starting_timestep, x_start, operator, y, orginal_input_motions, model_kwargs)
+        return samples
+# endregion
