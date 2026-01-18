@@ -35,21 +35,6 @@ def fix_motion(
     device = input_motions.device
     bs, nfeats, nframes = input_motions.shape
 
-    
-    # 可选：软修复（soft-inpaint）调度
-    if args.enable_sits and args.ProbDetNum:
-        # 将检测阶段的标签通道重复到所有通道，用作软修复步数的权重
-        soft_inpaint_ts = einops.repeat(re_sample_det_feats[:, [-1]], "b c l -> b (repeat c) l", repeat=nfeats)
-        # 将权重映射到 [0,1]，防止越界
-        soft_inpaint_ts = torch.clip((soft_inpaint_ts + 1 / 2), min=0.0, max=1.0)
-        # 通过正弦调制映射到扩散步数，得到各位置的软起始步
-        soft_inpaint_ts = torch.ceil((torch.sin(soft_inpaint_ts * torch.pi * 0.5)) * args.diffusion_steps).long()
-    else:
-        soft_inpaint_ts = None                                   # 未启用则不使用软修复
-
-    # 选择采样器
-    sample_fn = choose_sampler(diffusion, args.ts_respace)      # 根据配置选择采样器
-
 
     # TODO: 修改为post edit的修复思路
     # sample_fix = run_cleanup_selection(
