@@ -46,6 +46,8 @@ def fix_motion(
     #     "attention_mask": attention_mask,                       # 帧级注意力掩码
     # }    
 
+    starting_timestep = 501 # 扩散步的起点 TODO：这里需要和项目保持一致
+
     # 获取带噪声的潜变量起点
     motions_t = null_inversion.get_start(input_motions, starting_timestep=starting_timestep)
     # 执行带有郎之万优化和注意力控制的采样
