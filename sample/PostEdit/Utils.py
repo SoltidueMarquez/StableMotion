@@ -282,7 +282,7 @@ class NullInversion:
         这是 PostEdit 的核心，用于在去噪过程中强制让生成结果符合测量值（y）。
         """
         # 1. 计算总 de 迭代步数
-        num_steps = int((timestep - 1) / annel_interval) + 1
+        num_steps = int((timestep - 1) / annel_interval)
         print(f"\n[Debug] prev_step 开始反向循环:")
         print(f" - 初始时间步 (Resampled t): {timestep}")
         print(f" - 退火间隔 (annel_interval): {annel_interval}")

@@ -84,8 +84,8 @@ def fix_motion(
 
     # 3. 初始化 NullInversion 与 Langevin 配置
     lgvd_config = {
-        "num_steps": 10,       # 郎之万优化迭代步数
-        "lr": 1e-5,            # 学习率
+        "num_steps": 50,       # 郎之万优化迭代步数
+        "lr": 5e-5,            # 学习率
         "tau": 0.1,            # 噪声项系数 (增加 tau 以放宽测量约束)          
         "lr_min_ratio": 0.1
     }
