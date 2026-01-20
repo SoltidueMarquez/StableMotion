@@ -73,10 +73,18 @@ class InpaintingOperator(Operator):
                 "inpainted_motion": input_motions.clone().index_fill_(1, torch.tensor([nfeats-1], device=device), 1.0),
             },
             "inpaint_cond": ((~torch.ones_like(input_motions).bool().index_fill_(1, torch.tensor([nfeats-1], device=device), False))
-                             & attention_mask.unsqueeze(-2)),
+                            & attention_mask.unsqueeze(1)), # 确保与 [B, C, N] 广播一致
             "length": length,
-            "attention_mask": attention_mask,
+            "attention_mask": attention_mask, # 此时已修正为 [B, N]
         }
+
+        # Debug 打印形状，确保广播正确
+        print(f"\n[Debug] get_detection_mask:")
+        print(f" - inpainting_mask: {model_kwargs_detmode['y']['inpainting_mask'].shape}")
+        print(f" - inpainted_motion: {model_kwargs_detmode['y']['inpainted_motion'].shape}")
+        print(f" - attention_mask: {attention_mask.shape}")
+        print(f" - inpaint_cond: {model_kwargs_detmode['inpaint_cond'].shape}")
+        print(f" - length: {length}")
 
         with torch.no_grad():
             _re_sample = 0
@@ -96,6 +104,24 @@ class InpaintingOperator(Operator):
         # 2. 生成二进制掩码 (1=好, 0=坏)
         mask = (~is_bad).to(device).unsqueeze(1).float() 
         
+        # 增加 Debug 输出：显示检测到的坏帧区间
+        for b in range(bs):
+            bad_indices = is_bad[b, :length[b]] # 只看有效长度内的
+            intervals = []
+            start = None
+            for idx, flag in enumerate(bad_indices):
+                if flag:
+                    if start is None:
+                        start = idx
+                elif start is not None:
+                    intervals.append((start + 1, idx)) # 1-based
+                    start = None
+            if start is not None:
+                intervals.append((start + 1, int(length[b])))
+            
+            interval_str = "[" + ",".join(f"[{s},{e}]" for s, e in intervals) + "]"
+            print(f" [动作序列 {b}] 检测到的损坏区间: {interval_str}")
+
         # 3. 计算测量值 y：使用原始输入 input_motions 而不是重建的 _re_sample
         y = input_motions * mask
         
@@ -132,22 +158,26 @@ class LangevinDynamics(nn.Module):
         lr = self.get_lr(ratio)
         x = x0hat.clone().detach().requires_grad_(True)
         optimizer = torch.optim.SGD([x], lr)
-        for _ in pbar:
-            optimizer.zero_grad()
-            # 损失函数包含两部分：
-            # 1. 测量误差项（Data Fidelity）：保证优化后的结果经过算子后与测量值一致
-            loss = operator.error(x, measurement).sum() / (2 * self.tau ** 2)
-            # 2. 正则项（Prior）：保证优化后的结果不偏离初始猜测太远
-            loss += ((x - x0hat.detach()) ** 2).sum() / (2 * sigma ** 2)
-            loss.backward()
-            optimizer.step()
-            # 添加随机扰动（郎之万项）
-            with torch.no_grad():
-                epsilon = torch.randn_like(x)
-                x.data = x.data + np.sqrt(2 * lr) * epsilon
+        
+        # 使用 enable_grad 确保即使在外层是 no_grad 的情况下也能计算梯度
+        with torch.enable_grad():
+            for _ in pbar:
+                optimizer.zero_grad()
+                # 损失函数包含两部分：
+                # 1. 测量误差项（Data Fidelity）：保证优化后的结果经过算子后与测量值一致
+                loss = operator.error(x, measurement).sum() / (2 * self.tau ** 2)
+                # 2. 正则项（Prior）：保证优化后的结果不偏离初始猜测太远
+                loss += ((x - x0hat.detach()) ** 2).sum() / (2 * sigma ** 2)
+                loss.backward()
+                optimizer.step()
+                # 添加随机扰动（郎之万项）
+                with torch.no_grad():
+                    epsilon = torch.randn_like(x)
+                    x.data = x.data + np.sqrt(2 * lr) * epsilon
 
-            if torch.isnan(x).any():
-                return torch.zeros_like(x)
+                if torch.isnan(x).any():
+                    print("[Warning] Langevin optimization triggered NaN! Resetting to zeros.")
+                    return torch.zeros_like(x)
 
         return x.detach()
 
@@ -194,23 +224,30 @@ class NullInversion:
         measurement, 
         orginal_input_motions,
         model_kwargs,
-        annel_interval=100, 
+        annel_interval=5, 
         w = 0.25
     ):
         """
         在采样循环中执行反向步处理，并结合郎之万动力学（Langevin Dynamics）进行迭代优化。
         这是 PostEdit 的核心，用于在去噪过程中强制让生成结果符合测量值（y）。
         """
-        # 1. 计算总的迭代步数
+        # 1. 计算总 de 迭代步数
         num_steps = int((timestep - 1) / annel_interval)
-        
+        print(f"反向步数num_steps: {num_steps}")
+        print(f"初始时间步timestep: {timestep}")
+
+        # 初始化返回变量，确保在循环未执行时也有默认返回
+        final_x0 = sample 
+
         # 使用进度条显示扩散步的进度
         step_pbar = tqdm(range(num_steps), desc="    Diffusion Steps", leave=False)
         for step in step_pbar:
             # 2. 预测去噪后的原始动作估计 (x0)
             # 通过当前的采样状态 sample 预测出对应的干净动作估计 pred_original_sample
             pred_original_sample = self.sampler_one_step(timestep, sample, model_kwargs)
-            
+            # 更新最终结果：记录当前这一步估计
+            final_x0 = pred_original_sample
+
             # 3. 郎之万动力学优化
             # 调用 LGVD 模块，对预测出的 x0 进行优化。
             # 使其既接近模型预测的结果，又能够通过 operator 满足测量值 measurement。
@@ -219,14 +256,21 @@ class NullInversion:
             pred_x0 = self.lgvd.sample(pred_original_sample, operator, measurement, sigma, step / num_steps, verbose=True)
             
             # 4. 时间步递减
-            timestep = timestep - annel_interval
+            timestep = max(0, timestep - annel_interval)
             
             # 5. 混合与重新加噪
-            # 将优化后的结果与原始动作序列 (orginal_input_motions) 按比例 w 进行混合，以增强保真度。
-            # 然后调用 get_start 重新加上噪声，得到下一个时间步的采样状态 sample。
-            sample = self.get_start((1 - w) * pred_x0 + w * orginal_input_motions, timestep)
+            # 策略：条件锚定混合 (Conditional Anchor Blending)
+            # 在“好帧”位置 (mask=1)，将优化后的结果与原始输入按比例 w 混合，强制锚定到原始运动轨迹，增强保真度。
+            # 在“坏帧”位置 (mask=0)，完全采用优化后的预测值 pred_x0，防止原始输入中的损坏数据（噪声或跳变）干扰去噪过程。
+            mixed_x0 = torch.where(operator.current_mask.bool(), (1 - w) * pred_x0 + w * orginal_input_motions, pred_x0)
             
-        return pred_original_sample
+            # # 更新最终结果：记录当前这一步优化并混合后的最佳估计
+            # final_x0 = mixed_x0
+
+            # 将混合后的最佳动作估计重新加上对应时间步的噪声，得到下一个时间步的采样状态 sample (x_{t-1})
+            sample = self.get_start(mixed_x0, timestep)
+            
+        return final_x0
 
     def sampler_one_step(
         self, 
@@ -244,7 +288,6 @@ class NullInversion:
         
         # 2. 预测噪声
         # 注意：在 StableMotion 中，model 会根据 model_kwargs 处理 inpainting 等条件
-        # ...
         with torch.no_grad():
             # 检查是否有时间步缩放逻辑
             t_input = t
