@@ -54,6 +54,7 @@ def fix_motion(
     operator = InpaintingOperator(sigma=0.05)
     mask, y = InpaintingOperator.get_detection_mask(
         model=model,
+        diffusion=diffusion, # 传入 diffusion
         input_motions=input_motions,
         length=length,
         attention_mask=attention_mask,
@@ -63,7 +64,8 @@ def fix_motion(
     operator.set_mask(mask)
 
     # 2. 构造模型预测所需的 model_kwargs
-    # 修正：将检测到的 mask 传递给模型，让模型知道哪些帧是完好的（1），哪些是损坏的（0）
+    # 修正：inpaint_cond 的语义。在 StableMotion 中，1.0 表示“待补全/未知”，0.0 表示“已知”。
+    # 我们的 mask 是 1=好, 0=坏。因此 (1 - mask) 才是模型需要的引导信号（坏的地方设为 1）。
     model_kwargs_fix = {
         "y": {
             # 保持全 False。这意味着在模型的前向传播内部，不会强行用原图替换特征。
@@ -71,20 +73,20 @@ def fix_motion(
             "inpainting_mask": torch.zeros_like(input_motions).bool(), 
             "inpainted_motion": input_motions.clone(), 
         },
-        # 将检测出的 mask (1=好, 0=坏) 传给模型。
+        # 修正：将 (1 - mask) 传给模型，标记损坏区域为“待生成”
+        # 检测出的 mask (1=好, 0=坏)
         # 这为模型提供了重要的上下文锚点，让它在全局去噪时知道“好帧”应该还原成什么样，
         # 从而避免输出坍缩到全 0 或均值，并能更合理地补全“坏帧”。
-        "inpaint_cond": mask.expand(-1, nfeats, -1), 
+        "inpaint_cond": (1.0 - mask).expand(-1, nfeats, -1), 
         "length": length,
         "attention_mask": attention_mask,
     }
 
     # 3. 初始化 NullInversion 与 Langevin 配置
-    # 增加 tau 以减少梯度爆炸风险，减少迭代步数以提高速度和稳定性
     lgvd_config = {
-        "num_steps": 50,       # 郎之万优化迭代步数
-        "lr": 5e-5,            # 学习率
-        "tau": 0.1,            # 噪声项系数 (增加 tau 以放宽测量约束)
+        "num_steps": 10,       # 郎之万优化迭代步数
+        "lr": 1e-5,            # 学习率
+        "tau": 0.1,            # 噪声项系数 (增加 tau 以放宽测量约束)          
         "lr_min_ratio": 0.1
     }
     null_inversion = NullInversion(diffusion, model, lgvd_config)
@@ -109,18 +111,24 @@ def fix_motion(
 
     # 5. 解码与后处理
     # 将特征反归一化并拆出身体动作部分
-    sample_fix_det = motion_normalizer.inverse(sample_fix.transpose(1, 2).cpu())
-    sample_fix_body = sample_fix_det[..., :-1] # 去掉最后一维标签通道
-    fixed_motion = [globsmplrifkefeats_to_smpldata(_s) for _s in sample_fix_body]
+    # 修正：按样本单独处理，确保维度和长度正确
+    fixed_motion = []
+    sample_fix_cpu = sample_fix.transpose(1, 2).cpu() # [B, N, C]
+    for b in range(bs):
+        valid_len = int(length[b].item())
+        # 仅取有效长度部分进行反归一化和转换
+        feat_b = sample_fix_cpu[b, :valid_len, :]
+        feat_b_denorm = motion_normalizer.inverse(feat_b.unsqueeze(0))[0] # [N_valid, C]
+        fixed_motion.append(globsmplrifkefeats_to_smpldata(feat_b_denorm[..., :-1]))
 
-    # 将 mask 转换回布尔标签 [B, N] 用于返回
+    # 将 mask 转换回布尔标签
     labels = (mask.squeeze(1) < 0.5).cpu().numpy()
 
     print(f"sample_fix: {sample_fix}")
 
     return {
         "sample_fix_feats": sample_fix,   # [B, C, N] 修复后的特征
-        "fixed_motion": fixed_motion,     # 解码后的 SMPL 数据
+        "fixed_motion": fixed_motion,     # 解码后的 SMPL 数据列表
         "label": labels,                  # 检测到的坏帧标签
     }
 
@@ -192,12 +200,21 @@ def main():
         print(f"length: {length}")
 
         # Cache GT labels from label channel
-        temp_sample = motion_normalizer.inverse(input_motions.transpose(1, 2).cpu())  # 把输入反归一化到原尺度以便读取 GT
-        # 记录原始动作解码结果，用于可视化对比
-        all_motions += [globsmplrifkefeats_to_smpldata(_s) for _s in temp_sample[..., :-1]] 
+        temp_sample_normalized = input_motions.transpose(1, 2).cpu()  # [B, N, C]
         
-        gt_labels = (temp_sample[..., -1] > 0.5).numpy()           # 取标签通道作 GT 布尔
-        gt_labels_buf.append(gt_labels)
+        # 修正：记录原始动作解码结果，用于可视化对比（按样本单独处理有效长度）
+        for b in range(input_motions.shape[0]):
+            valid_len = int(length[b].item())
+            feat_b = temp_sample_normalized[b, :valid_len, :]
+            feat_b_denorm = motion_normalizer.inverse(feat_b.unsqueeze(0))[0] # [N_valid, C]
+
+            smpl_dict = globsmplrifkefeats_to_smpldata(feat_b_denorm[..., :-1])
+            smpl_dict = {k: v.numpy() if torch.is_tensor(v) else v for k, v in smpl_dict.items()}
+            all_motions.append(smpl_dict)
+            
+            # 从反归一化后的数据中提取 GT 标签（最后一维）
+            gt_labels = (feat_b_denorm[..., -1] > 0.5).numpy()
+            gt_labels_buf.append(gt_labels)
 
         all_input_motions_vec.append(input_motions.transpose(1, 2).cpu().numpy())  # 记录原始特征
 

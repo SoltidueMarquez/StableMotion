@@ -62,6 +62,13 @@ if __name__ == '__main__':
             )
             datas = np.load(data_path, allow_pickle=True).item()
             smpldatas = datas[motiontype]
+
+            # [Debug] Check if datas is empty
+            if not smpldatas:
+                print(f" [Warning] '{motiontype}' data list is empty in {data_path}")
+            else:
+                print(f" [Info] Loaded {len(smpldatas)} samples from '{motiontype}'")
+
             if motiontype == 'motion':
                 _gen_labels = datas.get('gt_labels', None)
             else:
@@ -87,15 +94,47 @@ if __name__ == '__main__':
                 for idx in range(n_motions)
             ]
             for idx, smpldata in enumerate(smpldatas):
+                # [Debug] Check smpldata for anomalies
+                print(f" --- Processing Sample {idx} ---")
+                if not isinstance(smpldata, dict):
+                    print(f" [Error] Sample {idx} is not a dictionary! Type: {type(smpldata)}")
+                    continue
+                
+                for key in ['poses', 'trans']:
+                    if key in smpldata:
+                        val = smpldata[key]
+                        if isinstance(val, np.ndarray):
+                            if np.isnan(val).any():
+                                print(f" [Error] Sample {idx} '{key}' contains NaN!")
+                            if np.isinf(val).any():
+                                print(f" [Error] Sample {idx} '{key}' contains Inf!")
+                            print(f" [Debug] Sample {idx} '{key}': min={val.min():.4f}, max={val.max():.4f}, mean={val.mean():.4f}, shape={val.shape}")
+                        else:
+                            print(f" [Warning] Sample {idx} '{key}' is not an ndarray! Type: {type(val)}")
+
                 output = extract_joints_smpldata(
                     smpldata = smpldata,
                     fps = FPS,
                     value_from = value_from, #could be joint
                     smpl_layer = smplh,
                     )
+                
                 if args.rendersmpl:
                     if value_from == 'smpl':
                         vertices = output["vertices"][:lengths[idx]]
+                        
+                        # [Debug] Check vertices for anomalies
+                        if np.isnan(vertices).any():
+                            print(f" [Error] Sample {idx} 'vertices' contains NaN!")
+                        if np.isinf(vertices).any():
+                            print(f" [Error] Sample {idx} 'vertices' contains Inf!")
+                        print(f" [Debug] Sample {idx} 'vertices': min={vertices.min():.4f}, max={vertices.max():.4f}, mean={vertices.mean():.4f}, shape={vertices.shape}")
+                        
+                        # Check if vertices are too far from origin
+                        v_center = np.mean(vertices, axis=(0, 1))
+                        if np.any(np.abs(v_center) > 1000):
+                            print(f" [Warning] Sample {idx} vertices center is very far from origin: {v_center}")
+
                         # print(np.min(vertices, axis=(0,1)))
                         vertices[..., 2] -= np.min(vertices[..., 2])
                     smpl_renderer(
@@ -111,6 +150,14 @@ if __name__ == '__main__':
                 else:
                     os.makedirs(os.path.dirname(joints_video_paths[idx]), exist_ok=True)
                     joints = output['joints'][:lengths[idx]]
+
+                    # [Debug] Check joints for anomalies
+                    if np.isnan(joints).any():
+                        print(f" [Error] Sample {idx} 'joints' contains NaN!")
+                    if np.isinf(joints).any():
+                        print(f" [Error] Sample {idx} 'joints' contains Inf!")
+                    print(f" [Debug] Sample {idx} 'joints': min={joints.min():.4f}, max={joints.max():.4f}, mean={joints.mean():.4f}, shape={joints.shape}")
+
                     joints_renderer(
                                     joints, title="", output=joints_video_paths[idx], canonicalize=False
                                 )

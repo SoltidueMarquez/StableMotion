@@ -4,6 +4,34 @@ from tqdm import tqdm
 import torch.nn as nn
 from abc import ABC, abstractmethod
 
+
+def build_corrupt_intervals(mask):
+    """
+    将 bool 掩码转换成 [start,end] 闭区间列表（1-based）。
+    """
+    intervals = []
+    start = None
+    for idx, flag in enumerate(mask):
+        if flag:
+            if start is None:
+                start = idx
+        elif start is not None:
+            intervals.append((start + 1, idx))
+            start = None
+    if start is not None:
+        intervals.append((start + 1, len(mask)))
+    return intervals
+
+
+def format_intervals(intervals):
+    """
+    把 [start,end] 区间列表拼成易读的字符串，比如 "[[1,5],[10,12]]"。
+    """
+    if not intervals:
+        return "[]"
+    return "[" + ",".join(f"[{s},{e}]" for s, e in intervals) + "]"
+
+
 # region 算子类
 class Operator(ABC):
     """
@@ -50,6 +78,7 @@ class InpaintingOperator(Operator):
     @staticmethod
     def get_detection_mask(
         model,
+        diffusion,
         input_motions,
         length,
         attention_mask,
@@ -88,14 +117,23 @@ class InpaintingOperator(Operator):
 
         with torch.no_grad():
             _re_sample = 0
-            _re_t = torch.ones((bs,), device=device) * 49
+            # 修复 Bug 1：使用正确的时间步并进行缩放
+            t_idx = args.diffusion_steps - 1
+            _re_t = torch.ones((bs,), device=device).long() * t_idx
+            t_input = _re_t
+            if hasattr(diffusion, "_scale_timesteps"):
+                t_input = diffusion._scale_timesteps(_re_t)
+            
+            print(f" - Detection using scaled t: {t_input[0].item()} (from index {t_idx})")
+
             for _ in tqdm(range(eval_times), desc="Detecting Bad Frames"):
                 noise_x = torch.randn_like(model_kwargs_detmode['y']['inpainted_motion'])
                 cond = model_kwargs_detmode['inpaint_cond']
                 x_gt = model_kwargs_detmode['y']['inpainted_motion']
                 x_input = torch.where(cond, noise_x, x_gt)
-                _re_sample += model(x_input, _re_t, **model_kwargs_detmode)
+                _re_sample += model(x_input, t_input, **model_kwargs_detmode)
             _re_sample /= eval_times
+            
 
         # 1. 计算坏帧标签
         _sample_cpu = motion_normalizer.inverse(_re_sample.transpose(1, 2).cpu())
@@ -106,21 +144,10 @@ class InpaintingOperator(Operator):
         
         # 增加 Debug 输出：显示检测到的坏帧区间
         for b in range(bs):
-            bad_indices = is_bad[b, :length[b]] # 只看有效长度内的
-            intervals = []
-            start = None
-            for idx, flag in enumerate(bad_indices):
-                if flag:
-                    if start is None:
-                        start = idx
-                elif start is not None:
-                    intervals.append((start + 1, idx)) # 1-based
-                    start = None
-            if start is not None:
-                intervals.append((start + 1, int(length[b])))
-            
-            interval_str = "[" + ",".join(f"[{s},{e}]" for s, e in intervals) + "]"
-            print(f" [动作序列 {b}] 检测到的损坏区间: {interval_str}")
+            valid_len = int(length[b].item())
+            curr_bad_mask = is_bad[b, :valid_len].cpu().numpy()
+            intervals = build_corrupt_intervals(curr_bad_mask)
+            print(f" - Sample {b}: {format_intervals(intervals)} (Total bad frames: {curr_bad_mask.sum()}/{valid_len})")
 
         # 3. 计算测量值 y：使用原始输入 input_motions 而不是重建的 _re_sample
         y = input_motions * mask
@@ -165,15 +192,22 @@ class LangevinDynamics(nn.Module):
                 optimizer.zero_grad()
                 # 损失函数包含两部分：
                 # 1. 测量误差项（Data Fidelity）：保证优化后的结果经过算子后与测量值一致
-                loss = operator.error(x, measurement).sum() / (2 * self.tau ** 2)
+                data_loss = operator.error(x, measurement).sum() / (2 * self.tau ** 2)
                 # 2. 正则项（Prior）：保证优化后的结果不偏离初始猜测太远
-                loss += ((x - x0hat.detach()) ** 2).sum() / (2 * sigma ** 2)
+                # 修复 Bug 2：为正则项权重设置上限，防止 sigma 趋近 0 时爆炸，同时增加梯度裁剪
+                reg_weight = 1 / (2 * max(sigma, 1e-3) ** 2)
+                reg_loss = ((x - x0hat.detach()) ** 2).sum() * reg_weight
+                loss = data_loss + reg_loss
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_([x], max_norm=5.0) # 限制梯度模长
                 optimizer.step()
-                # 添加随机扰动（郎之万项）
+                # 添加随机扰动 (Langevin term)
                 with torch.no_grad():
                     epsilon = torch.randn_like(x)
                     x.data = x.data + np.sqrt(2 * lr) * epsilon
+
+                if verbose and _ % 5 == 0:
+                    pbar.set_postfix({"Loss": f"{loss.item():.4f}", "Data": f"{data_loss.item():.4f}", "Reg": f"{reg_loss.item():.4f}"})
 
                 if torch.isnan(x).any():
                     print("[Warning] Langevin optimization triggered NaN! Resetting to zeros.")
@@ -208,11 +242,27 @@ class NullInversion:
         device = ref.device
         # 1. 确保 timestep 是张量且在正确设备上
         t = torch.tensor([starting_timestep] * ref.shape[0], device=device).long()
+        
+        # 修复 Bug 1：处理 SpacedDiffusion 的时间步映射
+        # 如果 starting_timestep 是重采样后的索引（如 49），我们需要获取它对应的原始时间步（如 980）
+        t_orig = t
+        if hasattr(self.diffusion, "timestep_map"):
+            # timestep_map 存储了重采样索引到原始索引的映射
+            t_orig = torch.tensor([self.diffusion.timestep_map[idx.item()] for idx in t], device=device).long()
+
+        # Debug: 检查加噪参数
+        print(f"[Debug] get_start (加噪):")
+        print(f" - 输入的时间步 t: {starting_timestep}")
+        print(f" - 映射过后的时间步 t: {t_orig[0].item()}")
+        if hasattr(self.diffusion, "sqrt_alphas_cumprod"):
+            print(f" - sqrt_alphas_cumprod: {self.diffusion.sqrt_alphas_cumprod[t_orig[0].item()]:.4f}")
+            print(f" - sqrt_one_minus_alphas_cumprod: {self.diffusion.sqrt_one_minus_alphas_cumprod[t_orig[0].item()]:.4f}")
+
         # 2. 如果没有提供噪声，则生成随机噪声
         if noise is None:
             noise = torch.randn_like(ref)
         # 3. 调用 StableMotion 的 q_sample 进行前向加噪
-        x_start = self.diffusion.q_sample(ref, t, noise=noise)
+        x_start = self.diffusion.q_sample(ref, t_orig, noise=noise)
         
         return x_start
     
@@ -232,31 +282,43 @@ class NullInversion:
         这是 PostEdit 的核心，用于在去噪过程中强制让生成结果符合测量值（y）。
         """
         # 1. 计算总 de 迭代步数
-        num_steps = int((timestep - 1) / annel_interval)
-        print(f"反向步数num_steps: {num_steps}")
-        print(f"初始时间步timestep: {timestep}")
+        num_steps = int((timestep - 1) / annel_interval) + 1
+        print(f"\n[Debug] prev_step 开始反向循环:")
+        print(f" - 初始时间步 (Resampled t): {timestep}")
+        print(f" - 退火间隔 (annel_interval): {annel_interval}")
+        print(f" - 总迭代步数 (num_steps): {num_steps}")
 
         # 初始化返回变量，确保在循环未执行时也有默认返回
         final_x0 = sample 
+        curr_t = timestep
 
         # 使用进度条显示扩散步的进度
         step_pbar = tqdm(range(num_steps), desc="    Diffusion Steps", leave=False)
         for step in step_pbar:
             # 2. 预测去噪后的原始动作估计 (x0)
             # 通过当前的采样状态 sample 预测出对应的干净动作估计 pred_original_sample
-            pred_original_sample = self.sampler_one_step(timestep, sample, model_kwargs)
-            # 更新最终结果：记录当前这一步估计
-            final_x0 = pred_original_sample
+            print(f"\n[Debug] Diffusion Step {step+1}/{num_steps}:")
+            print(f" - 当前去噪时间步 (curr_t): {curr_t}")
+            pred_original_sample = self.sampler_one_step(curr_t, sample, model_kwargs)
+            # # 更新最终结果：记录当前这一步估计
+            # final_x0 = pred_original_sample
 
             # 3. 郎之万动力学优化
             # 调用 LGVD 模块，对预测出的 x0 进行优化。
             # 使其既接近模型预测的结果，又能够通过 operator 满足测量值 measurement。
-            # 这里的噪声水平 sigma 直接从 diffusion 对象的预计算系数中获取
-            sigma = self.diffusion.sqrt_one_minus_alphas_cumprod[timestep]
+            # 修复 Bug 1：噪声水平 sigma 需要从原始步数索引中获取
+            t_orig_idx = curr_t
+            if hasattr(self.diffusion, "timestep_map"):
+                t_orig_idx = self.diffusion.timestep_map[curr_t]
+            sigma = self.diffusion.sqrt_one_minus_alphas_cumprod[t_orig_idx]
+            
+            print(f" - LGVD 优化 (sigma: {sigma:.4f}):")
             pred_x0 = self.lgvd.sample(pred_original_sample, operator, measurement, sigma, step / num_steps, verbose=True)
             
             # 4. 时间步递减
-            timestep = max(0, timestep - annel_interval)
+            next_t = max(0, curr_t - annel_interval)
+            print(f" - 时间步递减: {curr_t} -> {next_t}")
+            curr_t = next_t
             
             # 5. 混合与重新加噪
             # 策略：条件锚定混合 (Conditional Anchor Blending)
@@ -264,11 +326,12 @@ class NullInversion:
             # 在“坏帧”位置 (mask=0)，完全采用优化后的预测值 pred_x0，防止原始输入中的损坏数据（噪声或跳变）干扰去噪过程。
             mixed_x0 = torch.where(operator.current_mask.bool(), (1 - w) * pred_x0 + w * orginal_input_motions, pred_x0)
             
-            # # 更新最终结果：记录当前这一步优化并混合后的最佳估计
-            # final_x0 = mixed_x0
+            # 更新最终结果：记录当前这一步优化并混合后的最佳估计
+            final_x0 = mixed_x0
 
             # 将混合后的最佳动作估计重新加上对应时间步的噪声，得到下一个时间步的采样状态 sample (x_{t-1})
-            sample = self.get_start(mixed_x0, timestep)
+            # 这里调用 get_start 会打印加噪的相关信息
+            sample = self.get_start(mixed_x0, curr_t)
             
         return final_x0
 
@@ -286,27 +349,44 @@ class NullInversion:
         # 1. 准备时间步张量
         t = torch.tensor([timestep] * sample.shape[0], device=device).long()
         
+        # 映射到原始时间步 (用于 diffusion 的系数查找)
+        t_orig = t
+        if hasattr(self.diffusion, "timestep_map"):
+            t_orig = torch.tensor([self.diffusion.timestep_map[idx.item()] for idx in t], device=device).long()
+
         # 2. 预测噪声
         # 注意：在 StableMotion 中，model 会根据 model_kwargs 处理 inpainting 等条件
         with torch.no_grad():
-            # 检查是否有时间步缩放逻辑
+            # 检查是否有时间步缩放逻辑 (用于模型 embedding)
             t_input = t
             if hasattr(self.diffusion, "_scale_timesteps"):
                 t_input = self.diffusion._scale_timesteps(t)
             
+            # Debug: 检查预测参数
+            print(f"   [Debug] sampler_one_step (去噪预测):")
+            print(f"    - 函数输入时间步 t: {timestep}")
+            print(f"    - 映射过后时间步 t: {t_orig[0].item()}")
+            print(f"    - 缩放过后时间步 t (model input): {t_input[0].item()}")
+
             model_output = self.model(sample, t_input, **model_kwargs)
             
-        # 3. 解析模型输出
-        # 如果模型输出包含方差信息（如 Learned Sigma），则需要截取前一半作为噪声预测
-        # 在 StableMotion 中，通常 C 维度是 [2*original_C]，后半段是方差预测
+        # 3. 处理 Learned Sigma：如果输出通道是输入的两倍，截取前一半
         if model_output.shape[1] == sample.shape[1] * 2:
-            eps, _ = torch.split(model_output, sample.shape[1], dim=1)
+            model_output, _ = torch.split(model_output, sample.shape[1], dim=1)
+
+        # 4. 根据 model_mean_type 预测 x_0
+        from diffusion.gaussian_diffusion import ModelMeanType
+        print(f"    - 模型预测类型: {self.diffusion.model_mean_type}")
+        if self.diffusion.model_mean_type == ModelMeanType.START_X:
+            # StableMotion 默认：模型直接输出 x_0
+            print(f"    - [OK] START_X 类型，直接使用模型输出作为 pred_x0")
+            pred_x0 = model_output
+        elif self.diffusion.model_mean_type == ModelMeanType.EPSILON:
+            # 只有预测噪声时，才调用转换公式
+            print(f"    - EPSILON 类型，调用公式转换 pred_xstart_from_eps")
+            pred_x0 = self.diffusion._predict_xstart_from_eps(x_t=sample, t=t_orig, eps=model_output)
         else:
-            eps = model_output
-            
-        # 4. 根据公式从 eps 预测 x_0
-        # x_0 = (1/sqrt(alpha_cumprod)) * x_t - (sqrt(1/alpha_cumprod - 1)) * eps
-        pred_x0 = self.diffusion._predict_xstart_from_eps(x_t=sample, t=t, eps=eps)
+            raise NotImplementedError(f"不支持的 model_mean_type: {self.diffusion.model_mean_type}")
 
         return pred_x0
     
