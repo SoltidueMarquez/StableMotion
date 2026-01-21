@@ -117,7 +117,7 @@ class InpaintingOperator(Operator):
 
         with torch.no_grad():
             _re_sample = 0
-            # 修复 Bug 1：使用正确的时间步并进行缩放
+            # 使用正确的时间步并进行缩放
             t_idx = args.diffusion_steps - 1
             _re_t = torch.ones((bs,), device=device).long() * t_idx
             t_input = _re_t
@@ -155,7 +155,185 @@ class InpaintingOperator(Operator):
         return mask, y
 # endregion
 
+# region 修复流程封装
+@staticmethod
+def PostEdit_prev_step_PsampleLoop(
+    diffusion,                     # StableMotion diffusion 调度对象
+    model,                         # 用于去噪的模型
+    shape,                         # 输出张量的形状 (batch, channels, frames)
+    noise=None,                    # 可选：固定的初始噪声
+    clip_denoised=True,            # 是否将 x_0 预测裁剪到 [-1, 1]
+    denoised_fn=None,              # 可选：对 x_0 预测进行额外处理的函数
+    cond_fn=None,                  # 可选：classifier guidance 函数
+    model_kwargs=None,             # 额外条件（inpainting 掩码、length 等）
+    device=None,                   # 采样所用设备
+    progress=False,                # 是否显示 tqdm 进度条
+    skip_timesteps=0,              # 从倒数第几步开始采样
+    init_motions=None,               # 可选：用作 init_image 存在初始图片
+    cond_fn_with_grad=False,       # 若 True 则用包含梯度的 cond_fn
+    dump_steps=None,               # 需要记录的中间步索引
+    const_noise=False,             # 是否使用常量随机噪声
+    soft_inpaint_ts: torch.LongTensor=None,  # 软掩码控制每帧的起始步
+    use_postedit=False,            # 控制是否开启 PostEdit 优化
+    operator=None,                 # InpaintingOperator
+    measurement=None,              # 测量值 y
+    lgvd=None,                     # LangevinDynamics 对象
+    w=1.0,                         # 混合权重
+):
+    # 记录最终返回的结果
+    final = None
+    # 如果需要 dump 某些中间步，提前准备存储列表
+    dump = [] if dump_steps is not None else None
 
+    # 通过 progressive 版本按时间步迭代采样
+    for i, sample in enumerate(
+        PostEdit_prev_step_PSampleLoopProgressive(
+            diffusion,
+            model,
+            shape,
+            noise=noise,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            cond_fn=cond_fn,
+            model_kwargs=model_kwargs,
+            device=device,
+            progress=progress,
+            skip_timesteps=skip_timesteps,
+            init_motions=init_motions,
+            cond_fn_with_grad=cond_fn_with_grad,
+            const_noise=const_noise,
+            soft_inpaint_ts=soft_inpaint_ts,
+            use_postedit=use_postedit,
+            operator=operator,
+            measurement=measurement,
+            lgvd=lgvd,
+            w=w,
+        )
+    ):
+        # 可选：保存需要的中间步
+        if dump_steps is not None and i in dump_steps:
+            dump.append(torch.clone(sample["sample"]))
+        # 始终记录当前步最后一次迭代结果
+        final = sample
+
+    if dump_steps is not None:
+        return dump
+    # 返回最后一个时间步的样本
+    return final["sample"]
+
+@staticmethod
+def PostEdit_prev_step_PSampleLoopProgressive(
+    diffusion,                          # StableMotion diffusion 调度对象
+    model,                              # 用于去噪的模型
+    shape,                              # 输出张量的形状 (batch, channels, frames)
+    noise=None,                         # 可选：固定的初始噪声
+    clip_denoised=True,                 # 是否将 x_0 预测裁剪到 [-1, 1]
+    denoised_fn=None,                   # 可选：对 x_0 预测进行额外处理的函数
+    cond_fn=None,                       # 可选：classifier guidance 函数
+    model_kwargs=None,                  # 额外条件（inpainting 掩码、length 等）
+    device=None,                        # 采样所用设备
+    progress=False,                     # 是否显示 tqdm 进度条
+    skip_timesteps=0,                   # 从倒数第几步开始采样
+    init_motions=None,                  # 可选：用作 init_motions 存在初始动作
+    cond_fn_with_grad=False,            # 若 True 则用包含梯度的 cond_fn
+    const_noise=False,                  # 是否使用常量随机噪声
+    soft_inpaint_ts: torch.LongTensor = None,  # 软掩码控制每帧的起始步
+    use_postedit=False,                 # 控制是否开启 PostEdit 优化
+    operator=None,                      # InpaintingOperator
+    measurement=None,                   # 测量值 y
+    lgvd=None,                          # LangevinDynamics 对象
+    w=1.0,                              # 混合权重
+):
+    if device is None:
+        device = next(model.parameters()).device
+    assert isinstance(shape, (tuple, list))
+
+    # 如果外部传入 noise，则复用；否则随机初始化一个和目标 shape 一致的噪声张量
+    if noise is not None:
+        motions = noise
+    else:
+        motions = torch.randn(*shape, device=device)
+
+    # skip_timesteps>0 时表示我们想从某个中间时间步开始，此时没有 init_motions 就填 0 张量占位
+    if skip_timesteps and init_motions is None:
+        init_motions = torch.zeros_like(motions)
+
+    # 从当前 time step（num_timesteps - skip）开始往前遍历，倒序走完剩余步数
+    indices = list(range(diffusion.num_timesteps - skip_timesteps))[::-1]
+
+    # 如果提供了 init_motions，就先把它扩散（q_sample）到迭代起始时间步，作为第一帧输入
+    if init_motions is not None:
+        my_t = torch.ones([shape[0]], device=device, dtype=torch.long) * indices[0]
+        motions = diffusion.q_sample(init_motions, my_t, motions)
+
+    if progress:
+        # 只有在需要显示进度条时才导入 tqdm，避免对外部依赖的硬链接
+        from tqdm.auto import tqdm
+        indices = tqdm(indices)
+        
+    for i in indices:
+        # 构建当前时间步的张量
+        t = torch.tensor([i] * shape[0], device=device)
+
+        # 加噪
+        if soft_inpaint_ts is not None:
+            noise_motions = diffusion.q_sample(init_motions, t)
+            # 将需要重新还原的帧替换为 forward diffused（即“加噪”）后的样本
+            motions = torch.where(soft_inpaint_ts <= i+1, noise_motions, motions)
+            
+        # 执行去噪预测
+        with torch.no_grad():
+            sample_fn = diffusion.p_sample_with_grad if cond_fn_with_grad else diffusion.p_sample
+            out = sample_fn(
+                model,
+                motions,
+                t,
+                clip_denoised=clip_denoised,
+                denoised_fn=denoised_fn,
+                cond_fn=cond_fn,
+                model_kwargs=model_kwargs,
+                const_noise=const_noise,
+            )
+
+            # 实现 PostEdit 优化逻辑
+            if use_postedit and lgvd is not None and operator is not None and measurement is not None:
+                # 1. 获取模型预测的 x0
+                pred_x0 = out["pred_xstart"]
+                
+                # 2. 获取当前步的噪声水平 sigma
+                t_orig_idx = i
+                if hasattr(diffusion, "timestep_map"):
+                    t_orig_idx = diffusion.timestep_map[i]
+                sigma = diffusion.sqrt_one_minus_alphas_cumprod[t_orig_idx]
+                
+                # 3. 郎之万动力学优化
+                # 计算当前进度比例 ratio，用于动态调整学习率
+                ratio = (diffusion.num_timesteps - i) / diffusion.num_timesteps
+                optimized_x0 = lgvd.sample(pred_x0, operator, measurement, sigma, ratio)
+                
+                # 4. 条件锚定混合 (Conditional Anchor Blending)
+                # 在“好帧”位置 (mask=1)，强制将预测结果向原始输入 init_motions 靠拢
+                mixed_x0 = torch.where(operator.current_mask.bool(), (1 - w) * optimized_x0 + w * init_motions, optimized_x0)
+                
+                # 5. 重新加噪得到下一步的采样输入 x_{t-1}
+                # 这里我们需要将混合后的 x0 扩散到前一个时间步 t-1
+                t_prev = torch.tensor([max(0, i - 1)] * shape[0], device=device)
+                t_prev_orig = t_prev
+                if hasattr(diffusion, "timestep_map"):
+                    t_prev_orig = torch.tensor([diffusion.timestep_map[idx.item()] for idx in t_prev], device=device).long()
+                
+                motions = diffusion.q_sample(mixed_x0, t_prev_orig)
+                
+                # 更新返回字典，确保 yield 的是优化后的结果
+                out["sample"] = motions
+                out["pred_xstart"] = mixed_x0
+            else:
+                # 常规流程
+                motions = out["sample"]
+
+            yield out    
+            
+# endregion
 
 # region 郎之万动力学类
 class LangevinDynamics(nn.Module):
@@ -202,9 +380,10 @@ class LangevinDynamics(nn.Module):
                 torch.nn.utils.clip_grad_norm_([x], max_norm=5.0) # 限制梯度模长
                 optimizer.step()
                 # 添加随机扰动 (Langevin term)
+                # 修正：将随机噪声与当前 sigma 挂钩，防止在去噪后期引入过大抖动
                 with torch.no_grad():
                     epsilon = torch.randn_like(x)
-                    x.data = x.data + np.sqrt(2 * lr) * epsilon
+                    x.data = x.data + np.sqrt(2 * lr) * epsilon * sigma # 必须乘以 sigma
 
                 if verbose and _ % 5 == 0:
                     pbar.set_postfix({"Loss": f"{loss.item():.4f}", "Data": f"{data_loss.item():.4f}", "Reg": f"{reg_loss.item():.4f}"})
@@ -219,179 +398,4 @@ class LangevinDynamics(nn.Module):
         """动态调整学习率"""
         multiplier = (1 ** (1 / p) + ratio * (self.lr_min_ratio ** (1 / p) - 1 ** (1 / p))) ** p
         return multiplier * self.lr
-# endregion
-
-# region 空反向传播类（Null Inversion）：负责动作序列的加噪与反向优化采样。
-class NullInversion: 
-    def __init__(
-        self, 
-        diffusion,   # 这里对应 StableMotion 的 SpacedDiffusion 对象
-        model,       # 这里对应 StableMotion 的模型主体
-        lgvd_config
-    ):
-        self.diffusion = diffusion
-        self.model = model
-        self.lgvd = LangevinDynamics(**lgvd_config)
-
-    def get_start(self, ref, starting_timestep=999,noise=None):
-        """
-        根据输入动作序列 ref 添加指定步数的噪声。
-        ref: [B, C, N]
-        starting_timestep: 起始时间步 (通常是 0 到 T-1 之间的整数)
-        """
-        device = ref.device
-        # 1. 确保 timestep 是张量且在正确设备上
-        t = torch.tensor([starting_timestep] * ref.shape[0], device=device).long()
-        
-        # 修复 Bug 1：处理 SpacedDiffusion 的时间步映射
-        # 如果 starting_timestep 是重采样后的索引（如 49），我们需要获取它对应的原始时间步（如 980）
-        t_orig = t
-        if hasattr(self.diffusion, "timestep_map"):
-            # timestep_map 存储了重采样索引到原始索引的映射
-            t_orig = torch.tensor([self.diffusion.timestep_map[idx.item()] for idx in t], device=device).long()
-
-        # Debug: 检查加噪参数
-        print(f"[Debug] get_start (加噪):")
-        print(f" - 输入的时间步 t: {starting_timestep}")
-        print(f" - 映射过后的时间步 t: {t_orig[0].item()}")
-        if hasattr(self.diffusion, "sqrt_alphas_cumprod"):
-            print(f" - sqrt_alphas_cumprod: {self.diffusion.sqrt_alphas_cumprod[t_orig[0].item()]:.4f}")
-            print(f" - sqrt_one_minus_alphas_cumprod: {self.diffusion.sqrt_one_minus_alphas_cumprod[t_orig[0].item()]:.4f}")
-
-        # 2. 如果没有提供噪声，则生成随机噪声
-        if noise is None:
-            noise = torch.randn_like(ref)
-        # 3. 调用 StableMotion 的 q_sample 进行前向加噪
-        x_start = self.diffusion.q_sample(ref, t_orig, noise=noise)
-        
-        return x_start
-    
-    def prev_step(
-        self, 
-        timestep, 
-        sample, 
-        operator, 
-        measurement, 
-        orginal_input_motions,
-        model_kwargs,
-        annel_interval=5, 
-        w = 0.25
-    ):
-        """
-        在采样循环中执行反向步处理，并结合郎之万动力学（Langevin Dynamics）进行迭代优化。
-        这是 PostEdit 的核心，用于在去噪过程中强制让生成结果符合测量值（y）。
-        """
-        # 1. 计算总 de 迭代步数
-        num_steps = int((timestep - 1) / annel_interval)
-        print(f"\n[Debug] prev_step 开始反向循环:")
-        print(f" - 初始时间步 (Resampled t): {timestep}")
-        print(f" - 退火间隔 (annel_interval): {annel_interval}")
-        print(f" - 总迭代步数 (num_steps): {num_steps}")
-
-        # 初始化返回变量，确保在循环未执行时也有默认返回
-        final_x0 = sample 
-        curr_t = timestep
-
-        # 使用进度条显示扩散步的进度
-        step_pbar = tqdm(range(num_steps), desc="    Diffusion Steps", leave=False)
-        for step in step_pbar:
-            # 2. 预测去噪后的原始动作估计 (x0)
-            # 通过当前的采样状态 sample 预测出对应的干净动作估计 pred_original_sample
-            print(f"\n[Debug] Diffusion Step {step+1}/{num_steps}:")
-            print(f" - 当前去噪时间步 (curr_t): {curr_t}")
-            pred_original_sample = self.sampler_one_step(curr_t, sample, model_kwargs)
-            # # 更新最终结果：记录当前这一步估计
-            # final_x0 = pred_original_sample
-
-            # 3. 郎之万动力学优化
-            # 调用 LGVD 模块，对预测出的 x0 进行优化。
-            # 使其既接近模型预测的结果，又能够通过 operator 满足测量值 measurement。
-            # 修复 Bug 1：噪声水平 sigma 需要从原始步数索引中获取
-            t_orig_idx = curr_t
-            if hasattr(self.diffusion, "timestep_map"):
-                t_orig_idx = self.diffusion.timestep_map[curr_t]
-            sigma = self.diffusion.sqrt_one_minus_alphas_cumprod[t_orig_idx]
-            
-            print(f" - LGVD 优化 (sigma: {sigma:.4f}):")
-            pred_x0 = self.lgvd.sample(pred_original_sample, operator, measurement, sigma, step / num_steps, verbose=True)
-            
-            # 4. 时间步递减
-            next_t = max(0, curr_t - annel_interval)
-            print(f" - 时间步递减: {curr_t} -> {next_t}")
-            curr_t = next_t
-            
-            # 5. 混合与重新加噪
-            # 策略：条件锚定混合 (Conditional Anchor Blending)
-            # 在“好帧”位置 (mask=1)，将优化后的结果与原始输入按比例 w 混合，强制锚定到原始运动轨迹，增强保真度。
-            # 在“坏帧”位置 (mask=0)，完全采用优化后的预测值 pred_x0，防止原始输入中的损坏数据（噪声或跳变）干扰去噪过程。
-            mixed_x0 = torch.where(operator.current_mask.bool(), (1 - w) * pred_x0 + w * orginal_input_motions, pred_x0)
-            
-            # 更新最终结果：记录当前这一步优化并混合后的最佳估计
-            final_x0 = mixed_x0
-
-            # 将混合后的最佳动作估计重新加上对应时间步的噪声，得到下一个时间步的采样状态 sample (x_{t-1})
-            # 这里调用 get_start 会打印加噪的相关信息
-            sample = self.get_start(mixed_x0, curr_t)
-            
-        return final_x0
-
-    def sampler_one_step(
-        self, 
-        timestep, 
-        sample, 
-        model_kwargs
-    ):
-        """
-        单步采样：从 x_t 预测 x_0。
-        适配 StableMotion (OpenAI Diffusion) 架构。
-        """
-        device = sample.device
-        # 1. 准备时间步张量
-        t = torch.tensor([timestep] * sample.shape[0], device=device).long()
-        
-        # 映射到原始时间步 (用于 diffusion 的系数查找)
-        t_orig = t
-        if hasattr(self.diffusion, "timestep_map"):
-            t_orig = torch.tensor([self.diffusion.timestep_map[idx.item()] for idx in t], device=device).long()
-
-        # 2. 预测噪声
-        # 注意：在 StableMotion 中，model 会根据 model_kwargs 处理 inpainting 等条件
-        with torch.no_grad():
-            # 检查是否有时间步缩放逻辑 (用于模型 embedding)
-            t_input = t
-            if hasattr(self.diffusion, "_scale_timesteps"):
-                t_input = self.diffusion._scale_timesteps(t)
-            
-            # Debug: 检查预测参数
-            print(f"   [Debug] sampler_one_step (去噪预测):")
-            print(f"    - 函数输入时间步 t: {timestep}")
-            print(f"    - 映射过后时间步 t: {t_orig[0].item()}")
-            print(f"    - 缩放过后时间步 t (model input): {t_input[0].item()}")
-
-            model_output = self.model(sample, t_input, **model_kwargs)
-            
-        # 3. 处理 Learned Sigma：如果输出通道是输入的两倍，截取前一半
-        if model_output.shape[1] == sample.shape[1] * 2:
-            model_output, _ = torch.split(model_output, sample.shape[1], dim=1)
-
-        # 4. 根据 model_mean_type 预测 x_0
-        from diffusion.gaussian_diffusion import ModelMeanType
-        print(f"    - 模型预测类型: {self.diffusion.model_mean_type}")
-        if self.diffusion.model_mean_type == ModelMeanType.START_X:
-            # StableMotion 默认：模型直接输出 x_0
-            print(f"    - [OK] START_X 类型，直接使用模型输出作为 pred_x0")
-            pred_x0 = model_output
-        elif self.diffusion.model_mean_type == ModelMeanType.EPSILON:
-            # 只有预测噪声时，才调用转换公式
-            print(f"    - EPSILON 类型，调用公式转换 pred_xstart_from_eps")
-            pred_x0 = self.diffusion._predict_xstart_from_eps(x_t=sample, t=t_orig, eps=model_output)
-        else:
-            raise NotImplementedError(f"不支持的 model_mean_type: {self.diffusion.model_mean_type}")
-
-        return pred_x0
-    
-    def sample_in_batch(self, x_start, operator, y, orginal_input_motions, model_kwargs, starting_timestep=999):
-        """批量执行反向步"""
-        samples = self.prev_step(starting_timestep, x_start, operator, y, orginal_input_motions, model_kwargs)
-        return samples
 # endregion

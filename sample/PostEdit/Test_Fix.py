@@ -2,7 +2,6 @@ import os
 import numpy as np
 from argparse import ArgumentParser
 
-
 from numpy.random import f
 import torch
 import einops
@@ -18,7 +17,7 @@ from data_loaders.amasstools.globsmplrifke_feats import globsmplrifkefeats_to_sm
 
 from ema_pytorch import EMA
 from sample.utils import run_cleanup_selection, prepare_cond_fn, choose_sampler, build_output_dir
-from sample.PostEdit.Utils import InpaintingOperator, LangevinDynamics, PostEdit_prev_step_PsampleLoop
+from sample.PostEdit.Utils import InpaintingOperator,PostEdit_prev_step_PsampleLoop
 
 
 def post_edit_args():
@@ -36,6 +35,97 @@ def post_edit_args():
     )
     args = parse_and_load_from_model(parser)
     return args
+
+
+def get_start(diffusion, ref, starting_timestep=999,noise=None):
+    """
+    根据输入动作序列 ref 添加指定步数的噪声。
+    ref: [B, C, N]
+    starting_timestep: 起始时间步 (通常是 0 到 T-1 之间的整数)
+    """
+    device = ref.device
+    # 1. 确保 timestep 是张量且在正确设备上
+    t = torch.tensor([starting_timestep] * ref.shape[0], device=device).long()
+        
+    # 修复 Bug 1：处理 SpacedDiffusion 的时间步映射
+    # 如果 starting_timestep 是重采样后的索引（如 49），我们需要获取它对应的原始时间步（如 980）
+    t_orig = t
+    if hasattr(diffusion, "timestep_map"):
+        # timestep_map 存储了重采样索引到原始索引的映射
+        t_orig = torch.tensor([diffusion.timestep_map[idx.item()] for idx in t], device=device).long()
+
+    # Debug: 检查加噪参数
+    print(f"[Debug] get_start (加噪):")
+    print(f" - 输入的时间步 t: {starting_timestep}")
+    print(f" - 映射过后的时间步 t: {t_orig[0].item()}")
+    if hasattr(diffusion, "sqrt_alphas_cumprod"):
+        print(f" - sqrt_alphas_cumprod: {diffusion.sqrt_alphas_cumprod[t_orig[0].item()]:.4f}")
+        print(f" - sqrt_one_minus_alphas_cumprod: {diffusion.sqrt_one_minus_alphas_cumprod[t_orig[0].item()]:.4f}")
+
+    # 2. 如果没有提供噪声，则生成随机噪声
+    if noise is None:
+        noise = torch.randn_like(ref)
+    # 3. 调用 StableMotion 的 q_sample 进行前向加噪
+    x_start = diffusion.q_sample(ref, t_orig, noise=noise)
+
+    return x_start
+
+
+def sampler_one_step(
+        diffusion,
+        model,
+        timestep, 
+        sample, 
+        model_kwargs
+    ):
+        """
+        单步采样：从 x_t 预测 x_0。
+        适配 StableMotion (OpenAI Diffusion) 架构。
+        """
+        device = sample.device
+        # 1. 准备时间步张量
+        t = torch.tensor([timestep] * sample.shape[0], device=device).long()
+        
+        # 映射到原始时间步 (用于 diffusion 的系数查找)
+        t_orig = t
+        if hasattr(diffusion, "timestep_map"):
+            t_orig = torch.tensor([diffusion.timestep_map[idx.item()] for idx in t], device=device).long()
+
+        # 2. 预测噪声
+        # 注意：在 StableMotion 中，model 会根据 model_kwargs 处理 inpainting 等条件
+        with torch.no_grad():
+            # 检查是否有时间步缩放逻辑 (用于模型 embedding)
+            t_input = t
+            if hasattr(diffusion, "_scale_timesteps"):
+                t_input = diffusion._scale_timesteps(t)
+            
+            # Debug: 检查预测参数
+            print(f"   [Debug] sampler_one_step (去噪预测):")
+            print(f"    - 函数输入时间步 t: {timestep}")
+            print(f"    - 映射过后时间步 t: {t_orig[0].item()}")
+            print(f"    - 缩放过后时间步 t (model input): {t_input[0].item()}")
+
+            model_output = model(sample, t_input, **model_kwargs)
+            
+        # 3. 处理 Learned Sigma：如果输出通道是输入的两倍，截取前一半
+        if model_output.shape[1] == sample.shape[1] * 2:
+            model_output, _ = torch.split(model_output, sample.shape[1], dim=1)
+
+        # 4. 根据 model_mean_type 预测 x_0
+        from diffusion.gaussian_diffusion import ModelMeanType
+        print(f"    - 模型预测类型: {diffusion.model_mean_type}")
+        if diffusion.model_mean_type == ModelMeanType.START_X:
+            # StableMotion 默认：模型直接输出 x_0
+            print(f"    - [OK] START_X 类型，直接使用模型输出作为 pred_x0")
+            pred_x0 = model_output
+        elif diffusion.model_mean_type == ModelMeanType.EPSILON:
+            # 只有预测噪声时，才调用转换公式
+            print(f"    - EPSILON 类型，调用公式转换 pred_xstart_from_eps")
+            pred_x0 = diffusion._predict_xstart_from_eps(x_t=sample, t=t_orig, eps=model_output)
+        else:
+            raise NotImplementedError(f"不支持的 model_mean_type: {diffusion.model_mean_type}")
+
+        return pred_x0
 
 
 @torch.no_grad()
@@ -64,21 +154,9 @@ def fix_motion(
     operator.set_mask(mask)
 
     # 2. 构造模型预测所需的 model_kwargs
-    # 修正：inpaint_cond 的语义。在 StableMotion 中，1.0 表示“待补全/未知”，0.0 表示“已知”。
-    # 我们的 mask 是 1=好, 0=坏。因此 (1 - mask) 才是模型需要的引导信号（坏的地方设为 1）。
-    model_kwargs_fix = {
-        "y": {
-            "inpainting_mask": torch.zeros_like(input_motions).bool(), #这没什么软用
-            "inpainted_motion": input_motions.clone(), 
-        },
-        "inpaint_cond": torch.zeros_like(input_motions).bool(), 
-        "length": length,
-        "attention_mask": attention_mask,
-    }
-
     # model_kwargs_fix = {
     #     "y": {
-    #         "inpainting_mask": torch.zeros_like(input_motions).bool(), 
+    #         "inpainting_mask": torch.zeros_like(input_motions).bool(), #这没什么软用
     #         "inpainted_motion": input_motions.clone(), 
     #     },
     #     # 这里都是要修改的
@@ -86,34 +164,37 @@ def fix_motion(
     #     "length": length,
     #     "attention_mask": attention_mask,
     # }
-
-    # 3. 初始化 NullInversion 与 Langevin 配置
-    lgvd_config = {
-        "num_steps": 50,       # 郎之万优化迭代步数
-        "lr": 5e-5,            # 学习率
-        "tau": 0.05,            # 噪声项系数 (增加 tau 以放宽测量约束)          
-        "lr_min_ratio": 0.1
+    model_kwargs_fix = {
+        "y": {
+            "inpainting_mask": torch.zeros_like(input_motions).bool(), #这没什么软用
+            "inpainted_motion": input_motions.clone(), 
+        },
+        "inpaint_cond": (1.0 - mask).expand(-1, nfeats, -1), 
+        "length": length,
+        "attention_mask": attention_mask,
     }
-    lgvd = LangevinDynamics(**lgvd_config)
-    
-    # 4. 执行“加噪-去噪-朗之万优化”循环
+    sample_fn = choose_sampler(diffusion, args.ts_respace)
+
+    # 4. 执行“加噪-去噪-优化”循环
+    # 注意：init_image 配合 skip_timesteps 可以实现“从中间步加噪修复”
+    # 替换原来的加噪和 sampler_one_step 部分
     sample_fix = PostEdit_prev_step_PsampleLoop(
         diffusion,
         model,
         (bs, nfeats, nframes),
         clip_denoised=False,
         model_kwargs=model_kwargs_fix,
-        skip_timesteps=0,            # 从全噪声开始
-        init_motions=input_motions,   # 重要：提供原始参考以供锚定混合
+        skip_timesteps=0,  # 0 表示从纯噪声开始，如果要 Post-Edit 建议设为 30-40 (对应 50 步采样)
+        init_motions=input_motions, # Post-Edit 的原始参考
         progress=True,
-        use_postedit=True,           # 开启 PostEdit 逻辑
-        operator=operator,           # 传入掩码算子
-        measurement=y,               # 传入好帧观测值
-        lgvd=lgvd,                   # 传入优化器
-        w=0.8,                       # 建议设为 1.0 以完全钉死好帧，消除噪声
+        use_postedit=False,
+        operator=operator,
+        measurement=y,
+        lgvd=None,
+        w=1.0,
     )
 
-    # 使用StabelMotion的原始采样器进行对比，其实就是use_postedit = false
+    # 使用StabelMotion的原始采样器进行对比
     # 构造模型预测所需的 model_kwargs
     # sample_fix = sample_fn(
     #     model,
@@ -124,6 +205,8 @@ def fix_motion(
     #     init_motions=input_motions,
     #     progress=True,
     # )
+
+
 
     # 5. 解码与后处理
     # 将特征反归一化并拆出身体动作部分
@@ -280,6 +363,7 @@ def main():
 
     # Launch eval
     os.system(f"python -m eval.eval_scripts  --data_path {npy_path} --force_redo")  # 触发评估脚本
+
 
 
 if __name__ == "__main__":

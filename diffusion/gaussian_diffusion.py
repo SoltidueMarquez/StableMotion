@@ -259,36 +259,29 @@ class GaussianDiffusion:
         self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None
     ):
         """
-        Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
-        the initial x, x_0.
+        由模型预测 p(x_{t-1} | x_t) 的分布，包括均值、方差以及 x_0 的估计。
 
-        :param model: the model, which takes a signal and a batch of timesteps
-                      as input.
-        :param x: the [N x C x ...] tensor at time t.
-        :param t: a 1-D Tensor of timesteps.
-        :param clip_denoised: if True, clip the denoised signal into [-1, 1].
-        :param denoised_fn: if not None, a function which applies to the
-            x_start prediction before it is used to sample. Applies before
-            clip_denoised.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :return: a dict with the following keys:
-                 - 'mean': the model mean output.
-                 - 'variance': the model variance output.
-                 - 'log_variance': the log of 'variance'.
-                 - 'pred_xstart': the prediction for x_0.
+        :param model: 接受带噪输入与时间步并输出预测结果的模型。
+        :param x: 当前时间步的样本张量（形状 [N, C, ...]）。
+        :param t: 每个样本对应的时间步（1D 张量，长度等于 batch）。
+        :param clip_denoised: 若为 True，则将模型预测的 x_start 限制在 [-1, 1] 。
+        :param denoised_fn: 若传入函数，在裁剪之前对 x_start 做一次自定义处理。
+        :param model_kwargs: 额外的条件输入（如 inpainting 掩码、长度等）。
+        :return: 字典，包含 mean/variance/log_variance/pred_xstart 四个键。
         """
         if model_kwargs is None:
             model_kwargs = {}
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
+        # 模型的时间步输入可能需要 rescale（_scale_timesteps），因此封装它
         model_output = model(x, self._scale_timesteps(t), **model_kwargs)
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
             model_output, model_var_values = th.split(model_output, C, dim=1)
             if self.model_var_type == ModelVarType.LEARNED:
+                # 模型直接输出 log variance
                 model_log_variance = model_var_values
                 model_variance = th.exp(model_log_variance)
             else:
@@ -296,14 +289,13 @@ class GaussianDiffusion:
                     self.posterior_log_variance_clipped, t, x.shape
                 )
                 max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
-                # The model_var_values is [-1, 1] for [min_var, max_var].
+                # model_var_values 被限制在 [-1,1]，用于在最小/最大 log var 之间插值
                 frac = (model_var_values + 1) / 2
                 model_log_variance = frac * max_log + (1 - frac) * min_log
                 model_variance = th.exp(model_log_variance)
         else:
             model_variance, model_log_variance = {
-                # for fixedlarge, we set the initial (log-)variance like so
-                # to get a better decoder log likelihood.
+                # 对于 FIXED_LARGE，初始 log variance 取 posterior_variance[1] 拼接 beta
                 ModelVarType.FIXED_LARGE: (
                     np.append(self.posterior_variance[1], self.betas[1:]),
                     np.log(np.append(self.posterior_variance[1], self.betas[1:])),
@@ -470,21 +462,18 @@ class GaussianDiffusion:
         const_noise=False,
     ):
         """
-        Sample x_{t-1} from the model at the given timestep.
+        在给定时间步下，根据模型预测从 x_t 跳到 x_{t-1}。
 
-        :param model: the model to sample from.
-        :param x: the current tensor at x_{t-1}.
-        :param t: the value of t, starting at 0 for the first diffusion step.
-        :param clip_denoised: if True, clip the x_start prediction to [-1, 1].
-        :param denoised_fn: if not None, a function which applies to the
-            x_start prediction before it is used to sample.
-        :param cond_fn: if not None, this is a gradient function that acts
-                        similarly to the model.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :return: a dict containing the following keys:
-                 - 'sample': a random sample from the model.
-                 - 'pred_xstart': a prediction of x_0.
+        :param model: 用于去噪预测的模型模块。
+        :param x: 当前的带噪样本（即 x_t）。
+        :param t: 本次采样的时间步，0 表示第一步的扩散末端。
+        :param clip_denoised: 若为 True，则将模型预测的 x_start 裁剪到 [-1, 1]。
+        :param denoised_fn: 若传入函数，则在使用模型预测前先处理一次 x_start。
+        :param cond_fn: 若不为 None，则该函数计算一个与模型等效的梯度，作为额外条件。
+        :param model_kwargs: 扩散模型的额外条件（例如 inpainting 掩码）。
+        :return: 包含以下键的字典：
+                 - 'sample': 本步采样得到的 x_{t-1}。
+                 - 'pred_xstart': 当前模型对 x_0 的预测值。
         """
 
         ############################################################################
@@ -494,6 +483,7 @@ class GaussianDiffusion:
         if 'inpaint_cond' in model_kwargs.keys():
             inpaint_cond = model_kwargs['inpaint_cond']
             x_gt = model_kwargs['y']['inpainted_motion']
+            # 在投影阶段，把需要保持的 “好帧” 直接用原始动作替换，避免模型对这些帧重新建模
             x = torch.where(inpaint_cond, x, x_gt)
 
         out = self.p_mean_variance(
@@ -509,10 +499,12 @@ class GaussianDiffusion:
         if const_noise:
             noise = noise[[0]].repeat(x.shape[0], 1, 1, 1)
 
+        # nonzero_mask 控制只有 t!=0 时才叠加随机噪声
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
-        )  # no noise when t == 0
+        )
         if cond_fn is not None:
+            # 可选的 classifier guidance：通过 cond_fn 修改均值
             out["mean"] = self.condition_mean(
                 cond_fn, out, x, t, model_kwargs=model_kwargs
             )
@@ -525,6 +517,7 @@ class GaussianDiffusion:
         if 'inpaint_cond' in model_kwargs.keys():
             inpaint_cond = model_kwargs['inpaint_cond']
             x_gt = model_kwargs['y']['inpainted_motion']
+            # 终点再投影一次：确保输出的“好帧”与原始一致，防止后续步继续偏移
             sample = torch.where(inpaint_cond, sample, x_gt)
             out["pred_xstart"] = torch.where(inpaint_cond, out["pred_xstart"], x_gt)
 
@@ -541,21 +534,18 @@ class GaussianDiffusion:
         model_kwargs=None,
     ):
         """
-        Sample x_{t-1} from the model at the given timestep.
+        与 p_sample 相似，但在内部打开梯度计算，使得 cond_fn_with_grad 也能使用。
 
-        :param model: the model to sample from.
-        :param x: the current tensor at x_{t-1}.
-        :param t: the value of t, starting at 0 for the first diffusion step.
-        :param clip_denoised: if True, clip the x_start prediction to [-1, 1].
-        :param denoised_fn: if not None, a function which applies to the
-            x_start prediction before it is used to sample.
-        :param cond_fn: if not None, this is a gradient function that acts
-                        similarly to the model.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :return: a dict containing the following keys:
-                 - 'sample': a random sample from the model.
-                 - 'pred_xstart': a prediction of x_0.
+        :param model: 去噪模型。
+        :param x: 当前时间步的样本 x_t。
+        :param t: 当前时间步索引（0 表示扩散末端）。
+        :param clip_denoised: 若为 True，则对模型预测的 x_start 做 [-1, 1] 裁剪。
+        :param denoised_fn: 若传入函数，在使用模型预测前先处理一次。
+        :param cond_fn: 若不为空，则表示需要在梯度流中应用额外的条件引导。
+        :param model_kwargs: 模型额外输入（如 inpainting 掩码等）。
+        :return: dict，包含
+                 - 'sample': 当前时间步的去噪输出 x_{t-1}。
+                 - 'pred_xstart': 模型对 x_0 的预测（detach 后输出）。
         """
         with th.enable_grad():
             x = x.detach().requires_grad_()
@@ -570,12 +560,13 @@ class GaussianDiffusion:
             noise = th.randn_like(x)
             nonzero_mask = (
                 (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
-            )  # no noise when t == 0
+            )  # 只有 t != 0 时才加入噪声
             if cond_fn is not None:
                 out["mean"] = self.condition_mean_with_grad(
                     cond_fn, out, x, t, model_kwargs=model_kwargs
                 )
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        # pred_xstart 直接 detach，避免后续 backprop 影响原始图
         return {"sample": sample, "pred_xstart": out["pred_xstart"].detach()}
 
     def p_sample_loop(

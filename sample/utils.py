@@ -241,6 +241,7 @@ def run_cleanup_selection(
     else:
         soft_inpaint_ts = None
 
+    # p_sample_loop
     sample = sample_fn(
         model,                                                       # 模型
         (bs * forward_rp_times, nfeats, nframes),                    # 采样输出的形状（扩展后的 batch）
