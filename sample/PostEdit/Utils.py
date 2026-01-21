@@ -325,7 +325,7 @@ def PostEdit_prev_step_PSampleLoopProgressive(
                 motions = diffusion.q_sample(mixed_x0, t_prev_orig)
                 
                 # 更新返回字典，确保 yield 的是优化后的结果
-                out["sample"] = motions
+                out["sample"] = mixed_x0 # pred_x0是没有朗之万优化的结果
                 out["pred_xstart"] = mixed_x0
             else:
                 # 常规流程
