@@ -10,7 +10,7 @@ Detect-and-fix pipeline for AMASS motions using a diffusion model.
 
 import os
 import numpy as np
-
+from argparse import ArgumentParser
 
 import torch
 import einops
@@ -18,7 +18,7 @@ torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cudnn.benchmark = True
 
 from utils.fixseed import fixseed
-from utils.parser_util import det_args
+from utils.parser_util import add_base_options, add_sampling_options, parse_and_load_from_model
 from utils.model_util import create_model_and_diffusion
 from utils import dist_util
 from data_loaders.get_data import get_dataset_loader
@@ -27,6 +27,21 @@ from data_loaders.amasstools.globsmplrifke_feats import globsmplrifkefeats_to_sm
 from ema_pytorch import EMA
 from sample.utils import run_cleanup_selection, prepare_cond_fn, choose_sampler, build_output_dir
 
+def parser_args():
+    """
+    解析当前 post edit 脚本所需的命令行参数。
+    """
+    parser = ArgumentParser(description="integration for motion fixing.")
+    add_base_options(parser)
+    add_sampling_options(parser)
+    parser.add_argument(
+        "--folder_path",
+        type=str,
+        default="",
+        help="可选：直接遍历某个文件夹，跳过 split 列表。",
+    )
+    args = parse_and_load_from_model(parser)
+    return args
 
 
 @torch.no_grad()
@@ -262,7 +277,7 @@ def fix_motion(
 # Main
 # ---------------------------
 def main():
-    args = det_args()                             # 解析检测/修复所需的命令行参数
+    args = parser_args()                             # 解析检测/修复所需的命令行参数
     fixseed(args.seed)                            # 固定随机种子，保证可复现
 
     # Device / dist
@@ -284,6 +299,10 @@ def main():
         data_dir=args.testdata_dir,                                  # 数据路径
         normalizer_dir=args.normalizer_dir,                          # 归一化器存放路径
         shuffle=False,                                               # 不打乱顺序
+        sample_mode="sequential",
+        sequence_window_size=None,
+        sequence_stride=None,
+        folder_path=args.folder_path or None,
     )
     motion_normalizer = data.dataset.motion_loader.motion_normalizer # 获取特征归一化/反归一化工具
 

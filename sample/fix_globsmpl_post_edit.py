@@ -48,6 +48,7 @@ def fix_motion(
     length,                  # Tensor[int] shape [B]
     attention_mask,          # [B, N] bool
     motion_normalizer,       # 归一化工具
+    cond_fn,
 ):
     bs, nfeats, nframes = input_motions.shape
     # 1. 执行快速检测获取 Mask (1=好帧, 0=坏帧)
@@ -64,29 +65,29 @@ def fix_motion(
     operator.set_mask(mask)
 
     # 2. 构造模型预测所需的 model_kwargs
-    # 修正：inpaint_cond 的语义。在 StableMotion 中，1.0 表示“待补全/未知”，0.0 表示“已知”。
-    # 我们的 mask 是 1=好, 0=坏。因此 (1 - mask) 才是模型需要的引导信号（坏的地方设为 1）。
-    model_kwargs_fix = {
-        "y": {
-            "inpainting_mask": torch.zeros_like(input_motions).bool(), #这没什么软用
-            "inpainted_motion": input_motions.clone(), 
-        },
-        "inpaint_cond": torch.zeros_like(input_motions).bool(), 
-        "length": length,
-        "attention_mask": attention_mask,
-    }
-
     # model_kwargs_fix = {
     #     "y": {
-    #         "inpainting_mask": torch.zeros_like(input_motions).bool(), 
+    #         "inpainting_mask": mask.expand(-1, nfeats, -1).bool(), # 目前没什么软用
     #         "inpainted_motion": input_motions.clone(), 
     #     },
-    #     "inpaint_cond": mask.expand(-1, nfeats, -1).bool(), 
+    #     "inpaint_cond": torch.ones_like(input_motions).bool(), # 全部都需要修改
     #     "length": length,
     #     "attention_mask": attention_mask,
     # }
 
-    # 3. 初始化 NullInversion 与 Langevin 配置
+    # 修正：inpaint_cond 的语义。在 StableMotion 中，1.0 表示“待补全/未知”，0.0 表示“已知”。
+    # 我们的 mask 是 1=好, 0=坏。因此 (1 - mask) 才是模型需要的引导信号（坏的地方设为 1）。
+    model_kwargs_fix = {
+        "y": {
+            "inpainting_mask": mask.expand(-1, nfeats, -1).bool(), 
+            "inpainted_motion": input_motions.clone(), 
+        },
+        "inpaint_cond": (1 - mask.expand(-1, nfeats, -1)).bool(), 
+        "length": length,
+        "attention_mask": attention_mask,
+    }
+
+    # 3. 初始化 Langevin 配置
     lgvd_config = {
         "num_steps": args.lgvd_num_steps,       # 郎之万优化迭代步数
         "lr": args.lgvd_lr,                    # 学习率
@@ -95,34 +96,39 @@ def fix_motion(
     }
     lgvd = LangevinDynamics(**lgvd_config)
     
-    # 4. 执行“加噪-去噪-朗之万优化”循环
-    sample_fix = PostEdit_prev_step_PsampleLoop(
-        diffusion,
-        model,
-        (bs, nfeats, nframes),
-        clip_denoised=False,
-        model_kwargs=model_kwargs_fix,
-        skip_timesteps=0,            # 从全噪声开始
-        init_motions=input_motions,   # 重要：提供原始参考以供锚定混合
-        progress=True,
-        use_postedit=args.use_postedit,           
-        operator=operator,                          # 传入掩码算子
-        measurement=y,                              # 传入好帧观测值
-        lgvd=lgvd,                                  # 传入优化器
-        w=args.postedit_w,          
-    )
-
-    # # 使用StabelMotion的原始采样器进行对比，其实就是use_postedit = false
-    # sample_fn = choose_sampler(diffusion, args.ts_respace)
-    # sample_fix = sample_fn(
+    # # 4. 执行“加噪-去噪-朗之万优化”循环
+    # sample_fix = PostEdit_prev_step_PsampleLoop(
+    #     diffusion,
     #     model,
     #     (bs, nfeats, nframes),
     #     clip_denoised=False,
     #     model_kwargs=model_kwargs_fix,
-    #     skip_timesteps=0,
-    #     init_image=input_motions,
+    #     skip_timesteps=0,            # 从全噪声开始
+    #     init_motions=input_motions,   # 重要：提供原始参考以供锚定混合
     #     progress=True,
+    #     use_postedit=args.use_postedit,           
+    #     operator=operator,                          # 传入掩码算子
+    #     measurement=y,                              # 传入好帧观测值
+    #     lgvd=lgvd,                                  # 传入优化器
+    #     w=args.postedit_w,          
     # )
+
+    # 使用StabelMotion的原始采样器进行对比，其实就是use_postedit = false
+    sample_fn = choose_sampler(diffusion, args.ts_respace)
+    sample_fix = sample_fn(
+        model,
+        (bs, nfeats, nframes),
+        clip_denoised=False,
+        model_kwargs=model_kwargs_fix,
+        skip_timesteps=0,
+        init_image=input_motions,
+        progress=True,
+        dump_steps=None,                                             # 不导出中间步
+        noise=None,                                                  # 默认随机噪声
+        const_noise=False,                                           # 不固定噪声
+        soft_inpaint_ts=None,                                        # 可选软修复步调度 TODO:需要实现
+        cond_fn=cond_fn if args.classifier_scale else None,          # 可选 classifier guidance
+    )
 
     # 5. 解码与后处理
     # 将特征反归一化并拆出身体动作部分
@@ -188,11 +194,11 @@ def main():
     model.eval()                                                      # 推理模式
     #endregion
 
-    # # region 可选分类器/约束引导
-    # cond_fn = prepare_cond_fn(args, motion_normalizer, device)        # 可选分类器/约束引导
-    # if cond_fn is not None:
-    #     cond_fn.keywords["model"] = model                             # 注入模型引用
-    # #endregion
+    # region 可选分类器/约束引导
+    cond_fn = prepare_cond_fn(args, motion_normalizer, device)        # 可选分类器/约束引导
+    if cond_fn is not None:
+        cond_fn.keywords["model"] = model                             # 注入模型引用
+    #endregion
 
     # region 缓冲区：存储处理过程中的各种数据
     all_motions = []            # 检测阶段解码的 SMPL 字典
@@ -240,7 +246,7 @@ def main():
             input_motions=input_motions,                           # 原始输入特征
             length=length,                                         # 每样本长度
             attention_mask=attention_mask,                         # 有效帧掩码
-            motion_normalizer=motion_normalizer,                   # 归一化/反归一化工具
+            cond_fn=cond_fn,
         )
         sample_fix_feats = fix_out["sample_fix_feats"]             # 修复后的特征
         fixed_motion = fix_out["fixed_motion"]                     # 修复后解码的动作
