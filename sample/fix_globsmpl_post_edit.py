@@ -64,27 +64,6 @@ def fix_motion(
     )
     operator.set_mask(mask)
 
-    # 2. 构造模型预测所需的 model_kwargs
-    # model_kwargs_fix = {
-    #     "y": {
-    #         "inpainting_mask": mask.expand(-1, nfeats, -1).bool(), # 目前没什么软用
-    #         "inpainted_motion": input_motions.clone(), 
-    #     },
-    #     "inpaint_cond": torch.ones_like(input_motions).bool(), # 全部都需要修改
-    #     "length": length,
-    #     "attention_mask": attention_mask,
-    # }
-
-    # 1.5. 坏帧膨胀与 Mask 修正 (仿照 utils.py)
-    # 修正：inpaint_cond 的语义。在 StableMotion 中，1.0 表示“待补全/未知”，0.0 表示“已知”。
-    # 我们的 mask 是 1=好, 0=坏。因此 bad_labels (1 - mask) 才是模型需要的引导信号（坏的地方设为 1）。
-    bad_labels = (mask < 0.5).float()                                # [B, 1, N], 1=坏, 0=好
-    temp_bad_labels = bad_labels.clone()
-    bad_labels[..., 1:] += temp_bad_labels[..., :-1]                # 右侧膨胀
-    bad_labels[..., :-1] += temp_bad_labels[..., 1:]                # 左侧膨胀
-    for b, l in enumerate(length.cpu().numpy()):               # 序列最后一帧强制标记为“好”帧
-        bad_labels[b, :, l-1] = 0
-
     # 2. 构造模型预测所需的 model_kwargs (仿照 utils.py)
     # inpainting_mask: [B, C, N], True=保留, False=重绘
     inpainting_mask_fixmode = mask.expand(-1, nfeats, -1).bool().clone()
@@ -106,7 +85,8 @@ def fix_motion(
         "attention_mask": attention_mask,
     }
 
-    if args.enable_sits:                                                             # 可选软修复步调度
+    # 可选软修复步调度
+    if args.enable_sits:                                                             
         soft_inpaint_ts = einops.repeat(_re_sample[:, [-1]], 'b c l -> b (repeat c) l', repeat=nfeats)
         soft_inpaint_ts = torch.clip((soft_inpaint_ts + 1 / 2), min=0.0, max=1.0)
         soft_inpaint_ts = torch.ceil((torch.sin(soft_inpaint_ts * torch.pi * 0.5)) * args.diffusion_steps).long()

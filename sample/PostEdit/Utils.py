@@ -293,6 +293,7 @@ def PostEdit_prev_step_PSampleLoopProgressive(
                 cond_fn=cond_fn,
                 model_kwargs=model_kwargs,
                 const_noise=const_noise,
+                replaceGT = not use_postedit, # 使用朗之万优化则不替换好帧
             )
 
             # 实现 PostEdit 优化逻辑

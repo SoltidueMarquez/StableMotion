@@ -8,6 +8,7 @@ Docstrings have been added, as well as DDIM sampling and a new collection of bet
 
 import enum
 import math
+from pickle import TRUE
 
 import numpy as np
 import torch
@@ -460,6 +461,7 @@ class GaussianDiffusion:
         cond_fn=None,
         model_kwargs=None,
         const_noise=False,
+        replaceGT = True,
     ):
         """
         在给定时间步下，根据模型预测从 x_t 跳到 x_{t-1}。
@@ -483,8 +485,9 @@ class GaussianDiffusion:
         if 'inpaint_cond' in model_kwargs.keys():
             inpaint_cond = model_kwargs['inpaint_cond']
             x_gt = model_kwargs['y']['inpainted_motion']
-            # 在投影阶段，把需要保持的 “好帧” 直接用原始动作替换，避免模型对这些帧重新建模
-            x = torch.where(inpaint_cond, x, x_gt)
+            if replaceGT:
+                # 在投影阶段，把需要保持的 “好帧” 直接用原始动作替换，避免模型对这些帧重新建模
+                x = torch.where(inpaint_cond, x, x_gt)
 
         out = self.p_mean_variance(
             model,
@@ -532,6 +535,7 @@ class GaussianDiffusion:
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
+        replaceGT = True,
     ):
         """
         与 p_sample 相似，但在内部打开梯度计算，使得 cond_fn_with_grad 也能使用。
@@ -587,6 +591,7 @@ class GaussianDiffusion:
         dump_steps=None,
         const_noise=False,
         soft_inpaint_ts: th.LongTensor=None,
+        replaceGT = True,
     ):
         """
         Generate samples from the model.
@@ -627,6 +632,7 @@ class GaussianDiffusion:
             cond_fn_with_grad=cond_fn_with_grad,
             const_noise=const_noise,
             soft_inpaint_ts=soft_inpaint_ts,
+            replaceGT = replaceGT,
         )):
             if dump_steps is not None and i in dump_steps:
                 dump.append(deepcopy(sample["sample"]))
@@ -651,6 +657,7 @@ class GaussianDiffusion:
         cond_fn_with_grad=False,
         const_noise=False,
         soft_inpaint_ts: th.LongTensor=None,
+        replaceGT = True,
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -708,6 +715,7 @@ class GaussianDiffusion:
                     cond_fn=cond_fn,
                     model_kwargs=model_kwargs,
                     const_noise=const_noise,
+                    replaceGT = replaceGT,
                 )
                 yield out
                 img = out["sample"]
