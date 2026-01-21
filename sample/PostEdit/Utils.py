@@ -152,7 +152,7 @@ class InpaintingOperator(Operator):
         # 3. 计算测量值 y：使用原始输入 input_motions 而不是重建的 _re_sample
         y = input_motions * mask
         
-        return mask, y
+        return mask, y, _re_sample
 # endregion
 
 # region 修复流程封装

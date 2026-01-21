@@ -53,7 +53,7 @@ def fix_motion(
     bs, nfeats, nframes = input_motions.shape
     # 1. 执行快速检测获取 Mask (1=好帧, 0=坏帧)
     operator = InpaintingOperator(sigma=0.05)
-    mask, y = InpaintingOperator.get_detection_mask(
+    mask, y, _re_sample = InpaintingOperator.get_detection_mask(
         model=model,
         diffusion=diffusion, # 传入 diffusion
         input_motions=input_motions,
@@ -75,17 +75,43 @@ def fix_motion(
     #     "attention_mask": attention_mask,
     # }
 
+    # 1.5. 坏帧膨胀与 Mask 修正 (仿照 utils.py)
     # 修正：inpaint_cond 的语义。在 StableMotion 中，1.0 表示“待补全/未知”，0.0 表示“已知”。
-    # 我们的 mask 是 1=好, 0=坏。因此 (1 - mask) 才是模型需要的引导信号（坏的地方设为 1）。
+    # 我们的 mask 是 1=好, 0=坏。因此 bad_labels (1 - mask) 才是模型需要的引导信号（坏的地方设为 1）。
+    bad_labels = (mask < 0.5).float()                                # [B, 1, N], 1=坏, 0=好
+    temp_bad_labels = bad_labels.clone()
+    bad_labels[..., 1:] += temp_bad_labels[..., :-1]                # 右侧膨胀
+    bad_labels[..., :-1] += temp_bad_labels[..., 1:]                # 左侧膨胀
+    for b, l in enumerate(length.cpu().numpy()):               # 序列最后一帧强制标记为“好”帧
+        bad_labels[b, :, l-1] = 0
+
+    # 2. 构造模型预测所需的 model_kwargs (仿照 utils.py)
+    # inpainting_mask: [B, C, N], True=保留, False=重绘
+    inpainting_mask_fixmode = mask.expand(-1, nfeats, -1).bool().clone()
+    inpainting_mask_fixmode[:, -1] = True                        # 标签通道始终保留
+
+    # inpaint_motion: 修复起点，标签通道设为 -1.0 占位
+    inpaint_motion_fixmode = input_motions.clone()
+    inpaint_motion_fixmode[:, -1] = -1.0
+    inpaint_cond_fixmode = (~inpainting_mask_fixmode) & attention_mask.unsqueeze(-2)
+
     model_kwargs_fix = {
         "y": {
-            "inpainting_mask": mask.expand(-1, nfeats, -1).bool(), 
-            "inpainted_motion": input_motions.clone(), 
+            "inpainting_mask": inpainting_mask_fixmode.clone(), 
+            "inpainted_motion": inpaint_motion_fixmode.clone(), 
         },
-        "inpaint_cond": (1 - mask.expand(-1, nfeats, -1)).bool(), 
+        # "inpaint_cond": torch.ones_like(inpaint_cond_fixmode).bool(), # 全部都需要修改
+        "inpaint_cond": inpaint_cond_fixmode.clone(), 
         "length": length,
         "attention_mask": attention_mask,
     }
+
+    if args.enable_sits:                                                             # 可选软修复步调度
+        soft_inpaint_ts = einops.repeat(_re_sample[:, [-1]], 'b c l -> b (repeat c) l', repeat=nfeats)
+        soft_inpaint_ts = torch.clip((soft_inpaint_ts + 1 / 2), min=0.0, max=1.0)
+        soft_inpaint_ts = torch.ceil((torch.sin(soft_inpaint_ts * torch.pi * 0.5)) * args.diffusion_steps).long()
+    else:
+        soft_inpaint_ts = None
 
     # 3. 初始化 Langevin 配置
     lgvd_config = {
@@ -96,39 +122,44 @@ def fix_motion(
     }
     lgvd = LangevinDynamics(**lgvd_config)
     
-    # # 4. 执行“加噪-去噪-朗之万优化”循环
-    # sample_fix = PostEdit_prev_step_PsampleLoop(
-    #     diffusion,
-    #     model,
-    #     (bs, nfeats, nframes),
-    #     clip_denoised=False,
-    #     model_kwargs=model_kwargs_fix,
-    #     skip_timesteps=0,            # 从全噪声开始
-    #     init_motions=input_motions,   # 重要：提供原始参考以供锚定混合
-    #     progress=True,
-    #     use_postedit=args.use_postedit,           
-    #     operator=operator,                          # 传入掩码算子
-    #     measurement=y,                              # 传入好帧观测值
-    #     lgvd=lgvd,                                  # 传入优化器
-    #     w=args.postedit_w,          
-    # )
-
-    # 使用StabelMotion的原始采样器进行对比，其实就是use_postedit = false
-    sample_fn = choose_sampler(diffusion, args.ts_respace)
-    sample_fix = sample_fn(
+    # 4. 执行“加噪-去噪-朗之万优化”循环
+    sample_fix = PostEdit_prev_step_PsampleLoop(
+        diffusion,
         model,
         (bs, nfeats, nframes),
         clip_denoised=False,
         model_kwargs=model_kwargs_fix,
-        skip_timesteps=0,
-        init_image=input_motions,
+        skip_timesteps=0,            # 从全噪声开始
+        init_motions=input_motions,   # 重要：提供原始参考以供锚定混合
         progress=True,
         dump_steps=None,                                             # 不导出中间步
         noise=None,                                                  # 默认随机噪声
         const_noise=False,                                           # 不固定噪声
-        soft_inpaint_ts=None,                                        # 可选软修复步调度 TODO:需要实现
+        soft_inpaint_ts=soft_inpaint_ts,                             # 可选软修复步调度
         cond_fn=cond_fn if args.classifier_scale else None,          # 可选 classifier guidance
+        use_postedit=args.use_postedit,           
+        operator=operator,                          # 传入掩码算子
+        measurement=y,                              # 传入好帧观测值
+        lgvd=lgvd,                                  # 传入优化器
+        w=args.postedit_w,          
     )
+
+    # 使用StabelMotion的原始采样器进行对比，其实就是use_postedit = false
+    # sample_fn = choose_sampler(diffusion, args.ts_respace)
+    # sample_fix = sample_fn(
+    #     model,
+    #     (bs, nfeats, nframes),
+    #     clip_denoised=False,
+    #     model_kwargs=model_kwargs_fix,
+    #     skip_timesteps=args.skip_timesteps,
+    #     init_image=input_motions,
+    #     progress=True,
+    #     dump_steps=None,                                             # 不导出中间步
+    #     noise=None,                                                  # 默认随机噪声
+    #     const_noise=False,                                           # 不固定噪声
+    #     soft_inpaint_ts=soft_inpaint_ts,                             # 可选软修复步调度
+    #     cond_fn=cond_fn if args.classifier_scale else None,          # 可选 classifier guidance
+    # )
 
     # 5. 解码与后处理
     # 将特征反归一化并拆出身体动作部分
@@ -246,6 +277,7 @@ def main():
             input_motions=input_motions,                           # 原始输入特征
             length=length,                                         # 每样本长度
             attention_mask=attention_mask,                         # 有效帧掩码
+            motion_normalizer=motion_normalizer,
             cond_fn=cond_fn,
         )
         sample_fix_feats = fix_out["sample_fix_feats"]             # 修复后的特征
