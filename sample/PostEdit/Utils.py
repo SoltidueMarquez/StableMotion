@@ -275,7 +275,7 @@ def PostEdit_prev_step_PSampleLoopProgressive(
         # 构建当前时间步的张量
         t = torch.tensor([i] * shape[0], device=device)
 
-        # 加噪
+        # TODO：加噪
         if soft_inpaint_ts is not None:
             noise_motions = diffusion.q_sample(init_motions, t)
             # 将需要重新还原的帧替换为 forward diffused（即“加噪”）后的样本

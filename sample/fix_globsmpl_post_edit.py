@@ -81,18 +81,17 @@ def fix_motion(
     #         "inpainting_mask": torch.zeros_like(input_motions).bool(), 
     #         "inpainted_motion": input_motions.clone(), 
     #     },
-    #     # 这里都是要修改的
-    #     "inpaint_cond": torch.ones_like(input_motions).bool(), 
+    #     "inpaint_cond": mask.expand(-1, nfeats, -1).bool(), 
     #     "length": length,
     #     "attention_mask": attention_mask,
     # }
 
     # 3. 初始化 NullInversion 与 Langevin 配置
     lgvd_config = {
-        "num_steps": 50,       # 郎之万优化迭代步数
-        "lr": 5e-5,            # 学习率
-        "tau": 0.05,            # 噪声项系数 (增加 tau 以放宽测量约束)          
-        "lr_min_ratio": 0.1
+        "num_steps": args.lgvd_num_steps,       # 郎之万优化迭代步数
+        "lr": args.lgvd_lr,                    # 学习率
+        "tau": args.lgvd_tau,                   # 噪声项系数 (增加 tau 以放宽测量约束)          
+        "lr_min_ratio": args.lgvd_lr_min_ratio
     }
     lgvd = LangevinDynamics(**lgvd_config)
     
@@ -106,22 +105,22 @@ def fix_motion(
         skip_timesteps=0,            # 从全噪声开始
         init_motions=input_motions,   # 重要：提供原始参考以供锚定混合
         progress=True,
-        use_postedit=True,           # 开启 PostEdit 逻辑
-        operator=operator,           # 传入掩码算子
-        measurement=y,               # 传入好帧观测值
-        lgvd=lgvd,                   # 传入优化器
-        w=0.8,                       # 建议设为 1.0 以完全钉死好帧，消除噪声
+        use_postedit=args.use_postedit,           
+        operator=operator,                          # 传入掩码算子
+        measurement=y,                              # 传入好帧观测值
+        lgvd=lgvd,                                  # 传入优化器
+        w=args.postedit_w,          
     )
 
-    # 使用StabelMotion的原始采样器进行对比，其实就是use_postedit = false
-    # 构造模型预测所需的 model_kwargs
+    # # 使用StabelMotion的原始采样器进行对比，其实就是use_postedit = false
+    # sample_fn = choose_sampler(diffusion, args.ts_respace)
     # sample_fix = sample_fn(
     #     model,
     #     (bs, nfeats, nframes),
     #     clip_denoised=False,
     #     model_kwargs=model_kwargs_fix,
     #     skip_timesteps=0,
-    #     init_motions=input_motions,
+    #     init_image=input_motions,
     #     progress=True,
     # )
 
