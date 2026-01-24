@@ -6,6 +6,7 @@ from argparse import ArgumentParser
 from numpy.random import f
 import torch
 import einops
+from tqdm import tqdm
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cudnn.benchmark = True
 
@@ -17,7 +18,7 @@ from data_loaders.get_data import get_dataset_loader
 from data_loaders.amasstools.globsmplrifke_feats import globsmplrifkefeats_to_smpldata
 
 from ema_pytorch import EMA
-from sample.utils import run_cleanup_selection, prepare_cond_fn, choose_sampler, build_output_dir
+from sample.utils import run_cleanup_selection, prepare_cond_fn, choose_sampler, build_output_dir, batch_expander
 from sample.PostEdit.Utils import InpaintingOperator, LangevinDynamics, PostEdit_prev_step_PsampleLoop
 
 
@@ -33,6 +34,12 @@ def post_edit_args():
         type=str,
         default="",
         help="可选：直接遍历某个文件夹，跳过 split 列表。",
+    )
+    parser.add_argument(
+        "--forward_rp_times",
+        type=int,
+        default=5,
+        help="前向复制倍数（候选数量系数）。",
     )
     args = parse_and_load_from_model(parser)
     return args
@@ -64,8 +71,10 @@ def fix_motion(
     )
     operator.set_mask(mask)
 
-    # 2. 构造模型预测所需的 model_kwargs (仿照 utils.py)
-    # inpainting_mask: [B, C, N], True=保留, False=重绘
+    # 1.5. 准备候选生成 (forward_rp_times)
+    forward_rp_times = args.forward_rp_times
+    
+    # 构造原始修复参数 (batch 大小为 bs)
     inpainting_mask_fixmode = mask.expand(-1, nfeats, -1).bool().clone()
     inpainting_mask_fixmode[:, -1] = True                        # 标签通道始终保留
 
@@ -85,9 +94,17 @@ def fix_motion(
         "attention_mask": attention_mask,
     }
 
-    # 可选软修复步调度
-    if args.enable_sits:                                                             
-        soft_inpaint_ts = einops.repeat(_re_sample[:, [-1]], 'b c l -> b (repeat c) l', repeat=nfeats)
+    # 使用 batch_expander 扩展 batch 大小
+    rp_model_kwargs_fix = batch_expander(model_kwargs_fix, forward_rp_times)
+    rp_input_motions = einops.repeat(input_motions, "b c l -> (repeat b) c l", repeat=forward_rp_times)
+    rp_y = einops.repeat(y, "b c l -> (repeat b) c l", repeat=forward_rp_times)
+    rp_mask = einops.repeat(mask, "b c l -> (repeat b) c l", repeat=forward_rp_times)
+    operator.set_mask(rp_mask) # 更新算子的 mask 到扩展后的形状
+
+    # 可选软修复步调度 (SITS)
+    if args.enable_sits:
+        rp_re_sample = einops.repeat(_re_sample, "b c l -> (repeat b) c l", repeat=forward_rp_times)
+        soft_inpaint_ts = einops.repeat(rp_re_sample[:, [-1]], 'b c l -> b (repeat c) l', repeat=nfeats)
         soft_inpaint_ts = torch.clip((soft_inpaint_ts + 1 / 2), min=0.0, max=1.0)
         soft_inpaint_ts = torch.ceil((torch.sin(soft_inpaint_ts * torch.pi * 0.5)) * args.diffusion_steps).long()
     else:
@@ -101,47 +118,88 @@ def fix_motion(
         "lr_min_ratio": args.lgvd_lr_min_ratio
     }
     lgvd = LangevinDynamics(**lgvd_config)
-    
-    # 4. 执行“加噪-去噪-朗之万优化”循环
-    sample_fix = PostEdit_prev_step_PsampleLoop(
-        diffusion,
-        model,
-        (bs, nfeats, nframes),
-        clip_denoised=False,
-        model_kwargs=model_kwargs_fix,
-        skip_timesteps=0,            # 从全噪声开始
-        init_motions=input_motions,   # 重要：提供原始参考以供锚定混合
-        progress=True,
-        dump_steps=None,                                             # 不导出中间步
-        noise=None,                                                  # 默认随机噪声
-        const_noise=False,                                           # 不固定噪声
-        soft_inpaint_ts=soft_inpaint_ts,                             # 可选软修复步调度
-        cond_fn=cond_fn if args.classifier_scale else None,          # 可选 classifier guidance
-        use_postedit=args.use_postedit,           
-        operator=operator,                          # 传入掩码算子
-        measurement=y,                              # 传入好帧观测值
-        lgvd=lgvd,                                  # 传入优化器
-        w=args.postedit_w,          
-    )
 
-    # 使用StabelMotion的原始采样器进行对比，其实就是use_postedit = false
-    # sample_fn = choose_sampler(diffusion, args.ts_respace)
-    # sample_fix = sample_fn(
+    # 4. 执行多候选采样的“加噪-去噪-朗之万优化”循环
+    # sample_fix_candidates = PostEdit_prev_step_PsampleLoop(
+    #     diffusion,
     #     model,
-    #     (bs, nfeats, nframes),
+    #     (bs * forward_rp_times, nfeats, nframes),
     #     clip_denoised=False,
-    #     model_kwargs=model_kwargs_fix,
-    #     skip_timesteps=args.skip_timesteps,
-    #     init_image=input_motions,
+    #     model_kwargs=rp_model_kwargs_fix,
+    #     skip_timesteps=0,            # 从全噪声开始
+    #     init_motions=rp_input_motions,  # 重要：提供原始参考以供锚定混合
     #     progress=True,
     #     dump_steps=None,                                             # 不导出中间步
     #     noise=None,                                                  # 默认随机噪声
     #     const_noise=False,                                           # 不固定噪声
     #     soft_inpaint_ts=soft_inpaint_ts,                             # 可选软修复步调度
     #     cond_fn=cond_fn if args.classifier_scale else None,          # 可选 classifier guidance
+    #     use_postedit=args.use_postedit,           
+    #     operator=operator,                          # 测量算子
+    #     measurement=rp_y,                          # 测量值 y
+    #     lgvd=lgvd,                                 # 郎之万动力学优化器
+    #     w=args.postedit_w,                         # 混合权重
     # )
 
-    # 5. 解码与后处理
+    # 使用StabelMotion的原始采样器进行对比，其实就是use_postedit = false
+    sample_fn = choose_sampler(diffusion, args.ts_respace)
+    sample_fix_candidates = sample_fn(
+        model,
+        (bs * forward_rp_times, nfeats, nframes),
+        clip_denoised=False,
+        model_kwargs=rp_model_kwargs_fix,
+        skip_timesteps=args.skip_timesteps,
+        init_image=rp_input_motions,
+        progress=True,
+        dump_steps=None,                                             # 不导出中间步
+        noise=None,                                                  # 默认随机噪声
+        const_noise=False,                                           # 不固定噪声
+        soft_inpaint_ts=soft_inpaint_ts,                             # 可选软修复步调度
+        cond_fn=cond_fn if args.classifier_scale else None,          # 可选 classifier guidance
+    )
+
+    # 5. 打分并选择最佳候选 (参考 utils.py run_cleanup_selection)
+    eval_times = 25
+    device = input_motions.device
+    
+    # 构造用于打分的检测模式参数
+    model_kwargs_detmode = {
+        "y": {
+            "inpainting_mask": torch.ones_like(sample_fix_candidates).bool().index_fill_(1, torch.tensor([nfeats-1], device=device), False),
+            "inpainted_motion": sample_fix_candidates.clone().index_fill_(1, torch.tensor([nfeats-1], device=device), 1.0),
+        },
+        "inpaint_cond": ((~torch.ones_like(sample_fix_candidates).bool().index_fill_(1, torch.tensor([nfeats-1], device=device), False))
+                        & rp_model_kwargs_fix['attention_mask'].unsqueeze(1)), 
+        "length": rp_model_kwargs_fix['length'],
+        "attention_mask": rp_model_kwargs_fix['attention_mask'],
+    }
+
+    score = 0
+    with torch.no_grad():
+        t_idx = args.diffusion_steps - 1
+        _re_t = torch.ones((bs * forward_rp_times,), device=device).long() * t_idx
+        t_input = _re_t
+        if hasattr(diffusion, "_scale_timesteps"):
+            t_input = diffusion._scale_timesteps(_re_t)
+            
+        for _ in tqdm(range(eval_times), desc="Scoring Candidates"):
+            noise_x = torch.randn_like(model_kwargs_detmode['y']['inpainted_motion'])
+            cond = model_kwargs_detmode['inpaint_cond']
+            x_gt = model_kwargs_detmode['y']['inpainted_motion']
+            x_input = torch.where(cond, noise_x, x_gt)
+            score += model(x_input, t_input, **model_kwargs_detmode)[:, -1] # 累加标签通道得分
+    
+    score /= eval_times
+    score = torch.sum((score > 0.0) * rp_model_kwargs_fix['attention_mask'], dim=-1)  # 对有效帧求和得分
+    score = einops.rearrange(score, "(repeat b) -> repeat b", repeat=forward_rp_times)     # [forward_rp_times, bs]
+
+    sample_candidates_reshaped = einops.rearrange(sample_fix_candidates, "(repeat b) c l -> repeat b c l", repeat=forward_rp_times)  # 重排候选 [repeat, bs, C, L]
+    selected_id = torch.argmin(score, dim=0)                                       # [bs] 选择分数最低的候选
+    selected_id_for_gather = selected_id.view(1, bs, 1, 1).expand(1, bs, nfeats, nframes) # 展开成索引形状
+    sample_fix = torch.gather(sample_candidates_reshaped, dim=0, index=selected_id_for_gather).squeeze(0) # 挑出对应的最佳候选
+
+
+    # 6. 解码与后处理
     # 将特征反归一化并拆出身体动作部分
     # 修正：按样本单独处理，确保维度和长度正确
     fixed_motion = []
