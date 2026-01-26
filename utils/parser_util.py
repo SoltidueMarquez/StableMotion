@@ -258,7 +258,8 @@ def add_sampling_options(parser: ArgumentParser):
     group.add_argument("--lgvd_lr", default=5e-5, type=float, help="Langevin learning rate.")
     group.add_argument("--lgvd_tau", default=0.05, type=float, help="Langevin noise coefficient.")
     group.add_argument("--lgvd_lr_min_ratio", default=0.1, type=float, help="Langevin min LR ratio.")
-    group.add_argument("--postedit_w", default=0.8, type=float, help="Anchor blending weight.")
+    group.add_argument("--postedit_w_goodFrame", default=1.0, type=float, help="Anchor blending weight for good frames.")
+    group.add_argument("--postedit_w_badFrame", default=0.0, type=float, help="Anchor blending weight for bad frames.")
     group.add_argument("--use_postedit", action="store_true", help="Enable PostEdit enhancement logic.")
 
 

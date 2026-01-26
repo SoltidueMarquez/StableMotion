@@ -178,7 +178,8 @@ def PostEdit_prev_step_PsampleLoop(
     operator=None,                 # InpaintingOperator
     measurement=None,              # 测量值 y
     lgvd=None,                     # LangevinDynamics 对象
-    w=1.0,                         # 混合权重
+    w_goodFrame=1.0,               # 混合权重
+    w_badFrame=0.0,               # 混合权重
 ):
     # 记录最终返回的结果
     final = None
@@ -207,7 +208,8 @@ def PostEdit_prev_step_PsampleLoop(
             operator=operator,
             measurement=measurement,
             lgvd=lgvd,
-            w=w,
+            w_goodFrame=w_goodFrame,
+            w_badFrame=w_badFrame,
         )
     ):
         # 可选：保存需要的中间步
@@ -242,7 +244,8 @@ def PostEdit_prev_step_PSampleLoopProgressive(
     operator=None,                      # InpaintingOperator
     measurement=None,                   # 测量值 y
     lgvd=None,                          # LangevinDynamics 对象
-    w=1.0,                              # 混合权重
+    w_goodFrame=1.0,                    # 好帧混合权重
+    w_badFrame=0.0,                     # 坏帧数混合权重
 ):
     if device is None:
         device = next(model.parameters()).device
@@ -266,13 +269,17 @@ def PostEdit_prev_step_PSampleLoopProgressive(
         my_t = torch.ones([shape[0]], device=device, dtype=torch.long) * indices[0]
         motions = diffusion.q_sample(init_motions, my_t, motions)
 
+    # 保存 indices 的长度，用于计算 w_badFrame 的递减步长
+    num_indices = len(indices)
+
     if progress:
         # 只有在需要显示进度条时才导入 tqdm，避免对外部依赖的硬链接
         from tqdm.auto import tqdm
         indices = tqdm(indices)
         
+    w_badFrame_decrease = w_badFrame/num_indices
     for i in indices:
-        print(f" - PostEdit_prev_step_PSampleLoopProgressive: {i}")
+        # print(f" - PostEdit_prev_step_PSampleLoopProgressive: {i}")
         # 构建当前时间步的张量
         t = torch.tensor([i] * shape[0], device=device)
 
@@ -281,7 +288,21 @@ def PostEdit_prev_step_PSampleLoopProgressive(
             noise_motions = diffusion.q_sample(init_motions, t)
             # 将需要重新还原的帧替换为 forward diffused（即“加噪”）后的样本
             motions = torch.where(soft_inpaint_ts <= i+1, noise_motions, motions)
-            
+        
+        with torch.no_grad():
+            sample_fn = diffusion.p_sample_with_grad if cond_fn_with_grad else diffusion.p_sample
+            out_ReplaceGT = sample_fn(
+                model,
+                motions,
+                t,
+                clip_denoised=clip_denoised,
+                denoised_fn=denoised_fn,
+                cond_fn=cond_fn,
+                model_kwargs=model_kwargs,
+                const_noise=const_noise,
+                replaceGT = True,
+            )
+
         # 执行去噪预测
         with torch.no_grad():
             sample_fn = diffusion.p_sample_with_grad if cond_fn_with_grad else diffusion.p_sample
@@ -316,13 +337,23 @@ def PostEdit_prev_step_PSampleLoopProgressive(
                 # 4. 条件锚定混合 (Conditional Anchor Blending)
                 # 在“好帧”位置 (mask=1)，强制将预测结果向原始输入 init_motions 靠拢
                 # 条件锚定混合：支持两种模式
-                
+            
                 # 模式2：对所有帧（好帧+坏帧）都进行混合，保留原始输入的含义信息
                 # mixed_x0 = (1 - w) * optimized_x0 + w * init_motions
 
                 # 模式1：只在"好帧"位置 (mask=1) 进行混合，强制将预测结果向原始输入 init_motions 靠拢
                 # 坏帧位置只使用 optimized_x0，可能缺少原始输入的含义信息
-                mixed_x0 = torch.where(operator.current_mask.bool(), (1 - w) * optimized_x0 + w * init_motions, optimized_x0)
+                # mixed_x0 = torch.where(operator.current_mask.bool(), (1 - w) * optimized_x0 + w * init_motions, optimized_x0)
+
+                # 模式3：全量混合用不替换GT的预测输出，而不是和原始输入
+                mixed_x0 = torch.where(
+                    operator.current_mask.bool(),
+                    (1 - w_goodFrame) * optimized_x0 + w_goodFrame * init_motions,  # 好帧位置
+                    (1 - w_badFrame) * optimized_x0 + w_badFrame * out_ReplaceGT["pred_xstart"]   # 坏帧位置
+                )
+                # 需要做一个强度递减来避免混合到替换GT的断裂
+                w_badFrame=w_badFrame-w_badFrame_decrease
+                print(f" - w_badFrame: {w_badFrame}")
                 
                 # 5. 重新加噪得到下一步的采样输入 x_{t-1}
                 # 关键：在最后一步（i == 0）时，不需要加噪，直接输出 optimized_x0
@@ -375,8 +406,7 @@ class LangevinDynamics(nn.Module):
         ratio: 进度比例 (用于动态调整学习率)
         """
         num_steps = self.num_steps if steps is None else steps
-        print("根据算子（operator）和测量值（measurement）优化潜变量:")
-        pbar = tqdm(range(num_steps), desc="      Langevin Optim", leave=False) if verbose else range(num_steps)
+        pbar = tqdm(range(num_steps), desc="根据算子和测量值优化潜变量", leave=False) if verbose else range(num_steps)
         lr = self.get_lr(ratio)
         x = x0hat.clone().detach().requires_grad_(True)
         optimizer = torch.optim.SGD([x], lr)

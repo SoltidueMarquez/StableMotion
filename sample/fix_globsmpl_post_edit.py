@@ -138,7 +138,8 @@ def fix_motion(
         operator=operator,                          # 测量算子
         measurement=rp_y,                          # 测量值 y
         lgvd=lgvd,                                 # 郎之万动力学优化器
-        w=args.postedit_w,                         # 混合权重
+        w_goodFrame=args.postedit_w_goodFrame,                         # 混合权重
+        w_badFrame=args.postedit_w_badFrame,                         # 混合权重
     )
 
     # # 使用StabelMotion的原始采样器进行对比，其实就是use_postedit = false
