@@ -120,43 +120,43 @@ def fix_motion(
     lgvd = LangevinDynamics(**lgvd_config)
 
     # 4. 执行多候选采样的“加噪-去噪-朗之万优化”循环
-    # sample_fix_candidates = PostEdit_prev_step_PsampleLoop(
-    #     diffusion,
-    #     model,
-    #     (bs * forward_rp_times, nfeats, nframes),
-    #     clip_denoised=False,
-    #     model_kwargs=rp_model_kwargs_fix,
-    #     skip_timesteps=0,            # 从全噪声开始
-    #     init_motions=rp_input_motions,  # 重要：提供原始参考以供锚定混合
-    #     progress=True,
-    #     dump_steps=None,                                             # 不导出中间步
-    #     noise=None,                                                  # 默认随机噪声
-    #     const_noise=False,                                           # 不固定噪声
-    #     soft_inpaint_ts=soft_inpaint_ts,                             # 可选软修复步调度
-    #     cond_fn=cond_fn if args.classifier_scale else None,          # 可选 classifier guidance
-    #     use_postedit=args.use_postedit,           
-    #     operator=operator,                          # 测量算子
-    #     measurement=rp_y,                          # 测量值 y
-    #     lgvd=lgvd,                                 # 郎之万动力学优化器
-    #     w=args.postedit_w,                         # 混合权重
-    # )
-
-    # 使用StabelMotion的原始采样器进行对比，其实就是use_postedit = false
-    sample_fn = choose_sampler(diffusion, args.ts_respace)
-    sample_fix_candidates = sample_fn(
+    sample_fix_candidates = PostEdit_prev_step_PsampleLoop(
+        diffusion,
         model,
         (bs * forward_rp_times, nfeats, nframes),
         clip_denoised=False,
         model_kwargs=rp_model_kwargs_fix,
-        skip_timesteps=args.skip_timesteps,
-        init_image=rp_input_motions,
+        skip_timesteps=0,            # 从全噪声开始
+        init_motions=rp_input_motions,  # 重要：提供原始参考以供锚定混合
         progress=True,
         dump_steps=None,                                             # 不导出中间步
         noise=None,                                                  # 默认随机噪声
         const_noise=False,                                           # 不固定噪声
         soft_inpaint_ts=soft_inpaint_ts,                             # 可选软修复步调度
         cond_fn=cond_fn if args.classifier_scale else None,          # 可选 classifier guidance
+        use_postedit=args.use_postedit,           
+        operator=operator,                          # 测量算子
+        measurement=rp_y,                          # 测量值 y
+        lgvd=lgvd,                                 # 郎之万动力学优化器
+        w=args.postedit_w,                         # 混合权重
     )
+
+    # # 使用StabelMotion的原始采样器进行对比，其实就是use_postedit = false
+    # sample_fn = choose_sampler(diffusion, args.ts_respace)
+    # sample_fix_candidates = sample_fn(
+    #     model,
+    #     (bs * forward_rp_times, nfeats, nframes),
+    #     clip_denoised=False,
+    #     model_kwargs=rp_model_kwargs_fix,
+    #     skip_timesteps=args.skip_timesteps,
+    #     init_image=rp_input_motions,
+    #     progress=True,
+    #     dump_steps=None,                                             # 不导出中间步
+    #     noise=None,                                                  # 默认随机噪声
+    #     const_noise=False,                                           # 不固定噪声
+    #     soft_inpaint_ts=soft_inpaint_ts,                             # 可选软修复步调度
+    #     cond_fn=cond_fn if args.classifier_scale else None,          # 可选 classifier guidance
+    # )
 
     # 5. 打分并选择最佳候选 (参考 utils.py run_cleanup_selection)
     eval_times = 25

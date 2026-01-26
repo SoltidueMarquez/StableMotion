@@ -272,6 +272,7 @@ def PostEdit_prev_step_PSampleLoopProgressive(
         indices = tqdm(indices)
         
     for i in indices:
+        print(f" - PostEdit_prev_step_PSampleLoopProgressive: {i}")
         # 构建当前时间步的张量
         t = torch.tensor([i] * shape[0], device=device)
 
@@ -314,20 +315,35 @@ def PostEdit_prev_step_PSampleLoopProgressive(
                 
                 # 4. 条件锚定混合 (Conditional Anchor Blending)
                 # 在“好帧”位置 (mask=1)，强制将预测结果向原始输入 init_motions 靠拢
+                # 条件锚定混合：支持两种模式
+                
+                # 模式2：对所有帧（好帧+坏帧）都进行混合，保留原始输入的含义信息
+                # mixed_x0 = (1 - w) * optimized_x0 + w * init_motions
+
+                # 模式1：只在"好帧"位置 (mask=1) 进行混合，强制将预测结果向原始输入 init_motions 靠拢
+                # 坏帧位置只使用 optimized_x0，可能缺少原始输入的含义信息
                 mixed_x0 = torch.where(operator.current_mask.bool(), (1 - w) * optimized_x0 + w * init_motions, optimized_x0)
                 
                 # 5. 重新加噪得到下一步的采样输入 x_{t-1}
-                # 这里我们需要将混合后的 x0 扩散到前一个时间步 t-1
-                t_prev = torch.tensor([max(0, i - 1)] * shape[0], device=device)
-                t_prev_orig = t_prev
-                if hasattr(diffusion, "timestep_map"):
-                    t_prev_orig = torch.tensor([diffusion.timestep_map[idx.item()] for idx in t_prev], device=device).long()
-                
-                motions = diffusion.q_sample(mixed_x0, t_prev_orig)
-                
-                # 更新返回字典，确保 yield 的是优化后的结果
-                out["sample"] = mixed_x0 # pred_x0是没有朗之万优化的结果
-                out["pred_xstart"] = mixed_x0
+                # 关键：在最后一步（i == 0）时，不需要加噪，直接输出 optimized_x0
+                # 在中间步骤（i != 0）时，使用 mixed_x0 加噪继续去噪过程
+                if i > 0:
+                    # 中间步骤：对 mixed_x0 加噪，用于继续去噪过程
+                    t_prev = torch.tensor([i - 1] * shape[0], device=device)
+                    t_prev_orig = t_prev
+                    if hasattr(diffusion, "timestep_map"):
+                        t_prev_orig = torch.tensor([diffusion.timestep_map[idx.item()] for idx in t_prev], device=device).long()
+                    
+                    motions = diffusion.q_sample(mixed_x0, t_prev_orig)
+                    
+                    # 输出 mixed_x0（用于继续去噪）
+                    out["sample"] = mixed_x0
+                    out["pred_xstart"] = mixed_x0
+                else:
+                    # 最后一步（i == 0）：不需要加噪，直接输出 optimized_x0（朗之万优化后的结果，不含条件锚定混合）
+                    motions = optimized_x0  # 虽然不会再用到，但保持变量一致性
+                    out["sample"] = optimized_x0
+                    out["pred_xstart"] = optimized_x0
             else:
                 # 常规流程
                 motions = out["sample"]
