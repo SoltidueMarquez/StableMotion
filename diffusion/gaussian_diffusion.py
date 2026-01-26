@@ -521,8 +521,10 @@ class GaussianDiffusion:
             inpaint_cond = model_kwargs['inpaint_cond']
             x_gt = model_kwargs['y']['inpainted_motion']
             # 终点再投影一次：确保输出的“好帧”与原始一致，防止后续步继续偏移
-            sample = torch.where(inpaint_cond, sample, x_gt)
-            out["pred_xstart"] = torch.where(inpaint_cond, out["pred_xstart"], x_gt)
+            # 注意：在 postedit 模式下（replaceGT=False），跳过此替换，让朗之万优化和条件锚定混合来处理好帧
+            if replaceGT:
+                sample = torch.where(inpaint_cond, sample, x_gt)
+                out["pred_xstart"] = torch.where(inpaint_cond, out["pred_xstart"], x_gt)
 
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
