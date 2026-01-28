@@ -180,6 +180,7 @@ def PostEdit_prev_step_PsampleLoop(
     lgvd=None,                     # LangevinDynamics 对象
     w_goodFrame=1.0,               # 混合权重
     w_badFrame=0.0,               # 混合权重
+    w_badFrame_ratio=0.5,         # 坏帧混合权重衰减参数
 ):
     # 记录最终返回的结果
     final = None
@@ -210,6 +211,7 @@ def PostEdit_prev_step_PsampleLoop(
             lgvd=lgvd,
             w_goodFrame=w_goodFrame,
             w_badFrame=w_badFrame,
+            w_badFrame_ratio=w_badFrame_ratio,
         )
     ):
         # 可选：保存需要的中间步
@@ -246,6 +248,7 @@ def PostEdit_prev_step_PSampleLoopProgressive(
     lgvd=None,                          # LangevinDynamics 对象
     w_goodFrame=1.0,                    # 好帧混合权重
     w_badFrame=0.0,                     # 坏帧数混合权重
+    w_badFrame_ratio=0.5,               # 坏帧混合权重衰减参数
 ):
     if device is None:
         device = next(model.parameters()).device
@@ -269,31 +272,31 @@ def PostEdit_prev_step_PSampleLoopProgressive(
         my_t = torch.ones([shape[0]], device=device, dtype=torch.long) * indices[0]
         motions = diffusion.q_sample(init_motions, my_t, motions)
 
-    # 保存 indices 的长度，用于计算 w_badFrame 的递减步长
-    num_indices = len(indices)
-
     if progress:
         # 只有在需要显示进度条时才导入 tqdm，避免对外部依赖的硬链接
         from tqdm.auto import tqdm
         indices = tqdm(indices)
-        
-    w_badFrame_decrease = w_badFrame/num_indices
-    for i in indices:
-        # print(f" - PostEdit_prev_step_PSampleLoopProgressive: {i}")
+    
+    #region ---------- 第一轮：先算一遍 replaceGT=True 的预测结果，用于后续混合权重，这是有断裂的 ----------
+    motions_ReplacGT = motions.clone()
+    raw_indices = list(range(diffusion.num_timesteps - skip_timesteps))[::-1]
+    indices_iter = tqdm(raw_indices) if progress else raw_indices
+    print(" - 原始预测，替换GT预测motion序列:")
+
+    for i in indices_iter:
         # 构建当前时间步的张量
         t = torch.tensor([i] * shape[0], device=device)
-
-        # TODO：加噪
+        # 软修复加噪
         if soft_inpaint_ts is not None:
             noise_motions = diffusion.q_sample(init_motions, t)
             # 将需要重新还原的帧替换为 forward diffused（即“加噪”）后的样本
-            motions = torch.where(soft_inpaint_ts <= i+1, noise_motions, motions)
+            motions_ReplacGT = torch.where(soft_inpaint_ts <= i+1, noise_motions, motions_ReplacGT)
         
         with torch.no_grad():
             sample_fn = diffusion.p_sample_with_grad if cond_fn_with_grad else diffusion.p_sample
             out_ReplaceGT = sample_fn(
                 model,
-                motions,
+                motions_ReplacGT,
                 t,
                 clip_denoised=clip_denoised,
                 denoised_fn=denoised_fn,
@@ -302,7 +305,32 @@ def PostEdit_prev_step_PSampleLoopProgressive(
                 const_noise=const_noise,
                 replaceGT = True,
             )
+            motions_ReplacGT = out_ReplaceGT["sample"]
 
+        if not use_postedit:
+            # 这里就直接作为最终输出（只做替换GT baseline），按原始接口 yield
+            yield out_ReplaceGT
+    # endregion
+
+    # ---------- 如果不开启 PostEdit，第一轮已经 yield 完毕，直接返回 ----------
+    if not use_postedit: return
+
+    # ---------- 第二轮：PostEdit + 朗之万 + 混合 ----------
+    current_w_badFrame = w_badFrame
+    w_badFrame_decrease = w_badFrame / ((len(raw_indices) - 1) * w_badFrame_ratio) if len(raw_indices) > 1 else 0.0 # 暂时先给个衰减倍率看看
+    print(" - 第二轮：PostEdit + 朗之万 + 混合 ----------")
+
+    for i in indices:
+        # print(f" - PostEdit_prev_step_PSampleLoopProgressive: {i}")
+        # 构建当前时间步的张量
+        t = torch.tensor([i] * shape[0], device=device)
+
+        # 加噪
+        if soft_inpaint_ts is not None:
+            noise_motions = diffusion.q_sample(init_motions, t)
+            # 将需要重新还原的帧替换为 forward diffused（即“加噪”）后的样本
+            motions = torch.where(soft_inpaint_ts <= i+1, noise_motions, motions)
+    
         # 执行去噪预测
         with torch.no_grad():
             sample_fn = diffusion.p_sample_with_grad if cond_fn_with_grad else diffusion.p_sample
@@ -323,20 +351,20 @@ def PostEdit_prev_step_PSampleLoopProgressive(
                 # 1. 获取模型预测的 x0
                 pred_x0 = out["pred_xstart"]
                 
-                # 2. 获取当前步的噪声水平 sigma
+                #region 2. 获取当前步的噪声水平 sigma
                 t_orig_idx = i
                 if hasattr(diffusion, "timestep_map"):
                     t_orig_idx = diffusion.timestep_map[i]
                 sigma = diffusion.sqrt_one_minus_alphas_cumprod[t_orig_idx]
+                #endregion
                 
-                # 3. 郎之万动力学优化
+                #region 3. 郎之万动力学优化
                 # 计算当前进度比例 ratio，用于动态调整学习率
                 ratio = (diffusion.num_timesteps - i) / diffusion.num_timesteps
                 optimized_x0 = lgvd.sample(pred_x0, operator, measurement, sigma, ratio)
+                #endregion
                 
-                # 4. 条件锚定混合 (Conditional Anchor Blending)
-                # 在“好帧”位置 (mask=1)，强制将预测结果向原始输入 init_motions 靠拢
-                # 条件锚定混合：支持两种模式
+                #region 4. 条件锚定混合 (Conditional Anchor Blending)
             
                 # 模式2：对所有帧（好帧+坏帧）都进行混合，保留原始输入的含义信息
                 # mixed_x0 = (1 - w) * optimized_x0 + w * init_motions
@@ -348,14 +376,15 @@ def PostEdit_prev_step_PSampleLoopProgressive(
                 # 模式3：全量混合用不替换GT的预测输出，而不是和原始输入
                 mixed_x0 = torch.where(
                     operator.current_mask.bool(),
-                    (1 - w_goodFrame) * optimized_x0 + w_goodFrame * init_motions,  # 好帧位置
-                    (1 - w_badFrame) * optimized_x0 + w_badFrame * out_ReplaceGT["pred_xstart"]   # 坏帧位置
+                    (1 - w_goodFrame) * optimized_x0 + w_goodFrame * init_motions,  # 好帧位置，motions_ReplacGT和init_motions都是一样的
+                    (1 - current_w_badFrame) * optimized_x0 + current_w_badFrame * motions_ReplacGT   # 坏帧位置
                 )
-                # 需要做一个强度递减来避免混合到替换GT的断裂
-                w_badFrame=w_badFrame-w_badFrame_decrease
-                print(f" - w_badFrame: {w_badFrame}")
-                
-                # 5. 重新加噪得到下一步的采样输入 x_{t-1}
+                # 需要做一个强度递减来避免混合到替换GT的预测结果的边缘断裂
+                current_w_badFrame = max(0.0, current_w_badFrame - w_badFrame_decrease)
+                print(f" - w_badFrame: {current_w_badFrame}")
+                #endregion
+
+                #region 5. 重新加噪得到下一步的采样输入 x_{t-1}
                 # 关键：在最后一步（i == 0）时，不需要加噪，直接输出 optimized_x0
                 # 在中间步骤（i != 0）时，使用 mixed_x0 加噪继续去噪过程
                 if i > 0:
@@ -375,10 +404,8 @@ def PostEdit_prev_step_PSampleLoopProgressive(
                     motions = optimized_x0  # 虽然不会再用到，但保持变量一致性
                     out["sample"] = optimized_x0
                     out["pred_xstart"] = optimized_x0
-            else:
-                # 常规流程
-                motions = out["sample"]
-
+                #endregion
+            
             yield out    
             
 # endregion

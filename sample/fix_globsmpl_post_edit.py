@@ -140,6 +140,7 @@ def fix_motion(
         lgvd=lgvd,                                 # 郎之万动力学优化器
         w_goodFrame=args.postedit_w_goodFrame,                         # 混合权重
         w_badFrame=args.postedit_w_badFrame,                         # 混合权重
+        w_badFrame_ratio=args.postedit_w_badFrame_ratio,             # 坏帧混合权重衰减参数
     )
 
     # # 使用StabelMotion的原始采样器进行对比，其实就是use_postedit = false

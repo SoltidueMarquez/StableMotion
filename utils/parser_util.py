@@ -261,6 +261,7 @@ def add_sampling_options(parser: ArgumentParser):
     group.add_argument("--postedit_w_goodFrame", default=1.0, type=float, help="Anchor blending weight for good frames.")
     group.add_argument("--postedit_w_badFrame", default=0.0, type=float, help="Anchor blending weight for bad frames.")
     group.add_argument("--use_postedit", action="store_true", help="Enable PostEdit enhancement logic.")
+    group.add_argument("--postedit_w_badFrame_ratio",default=0.5,type=float,help="Fraction of diffusion steps over which w_badFrame decays to 0.",)
 
 
 # ----------------------------
